@@ -92,7 +92,7 @@ static ncclResult_t shmSendSetup(struct ncclComm* comm, struct ncclTopoGraph* gr
   TRACE(NCCL_SHM,"Opened shmName %s shmSize %d", shmPath, info->shmSize);
   memcpy(info->shmName, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof(info->shmName));
 
-  INFO(NCCL_INIT|NCCL_SHM,"Channel %02d : %d[%d] -> %d[%d] via SHM/%s/%s", channelId, myInfo->rank, myInfo->nvmlDev, peerInfo->rank, peerInfo->nvmlDev, useMemcpySend?"CE":"direct", useMemcpyRecv?"CE":"direct");
+  INFO(NCCL_INIT|NCCL_SHM,"Channel %02d : %d[%lx] -> %d[%lx] via SHM/%s/%s comm %p nRanks %02d", channelId, myInfo->rank, myInfo->busId, peerInfo->rank, peerInfo->busId, useMemcpySend?"CE":"direct", useMemcpyRecv?"CE":"direct", comm, comm->nRanks);
   return ncclSuccess;
 }
 
@@ -221,7 +221,7 @@ static ncclResult_t shmSendProxyConnect(struct ncclProxyConnection* connection, 
   NCCLCHECK(ncclCalloc(&proxyInfo, 1));
   if (reqSize != sizeof(struct shmProxyInfo)) return ncclInternalError;
   memcpy(proxyInfo, reqBuff, reqSize);
-  NCCLCHECK(ncclCudaCalloc(&proxyInfo->devFifo, proxyState->buffSizes[NCCL_PROTO_SIMPLE]));
+  NCCLCHECK(ncclCudaCalloc(&proxyInfo->devFifo, proxyState->buffSizes[NCCL_PROTO_SIMPLE], nullptr));
   NCCLCHECK(ncclCudaHostCalloc(&proxyInfo->ceRecvMem, 1));
   CUDACHECK(cudaStreamCreateWithFlags(&proxyInfo->stream, cudaStreamNonBlocking));
   for (int i=0; i<NCCL_STEPS; i++) {
@@ -239,7 +239,7 @@ static ncclResult_t shmRecvProxyConnect(struct ncclProxyConnection* connection, 
   NCCLCHECK(ncclCalloc(&proxyInfo, 1));
   if (reqSize != sizeof(struct shmProxyInfo)) return ncclInternalError;
   memcpy(proxyInfo, reqBuff, reqSize);
-  NCCLCHECK(ncclCudaCalloc(&proxyInfo->devFifo, proxyState->buffSizes[NCCL_PROTO_SIMPLE]));
+  NCCLCHECK(ncclCudaCalloc(&proxyInfo->devFifo, proxyState->buffSizes[NCCL_PROTO_SIMPLE], nullptr));
   NCCLCHECK(ncclCudaHostCalloc(&proxyInfo->ceRecvMem, 1));
   CUDACHECK(cudaStreamCreateWithFlags(&proxyInfo->stream, cudaStreamNonBlocking));
   for (int i=0; i<NCCL_STEPS; i++) {

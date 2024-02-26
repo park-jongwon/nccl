@@ -1,8 +1,16 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
+ * Modifications Copyright (c) Microsoft Corporation. Licensed under the MIT License.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
+
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit.h"
+#endif
+
+#include "msccl/msccl_struct.h"
 
 template<typename T, typename RedOp, typename Fan, int Direct,
          int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts>
@@ -44,58 +52,36 @@ class Primitives<
   };
   uint64_t *connStepPtr;
   uint64_t connStepCache; // Cache last seen value of (*connStepPtr)
+  uint64_t* barriers;
+  uint64_t* barrier_next;
+  uint32_t* next_hdp_reg;
+
+#if defined(ENABLE_NPKIT)
+public:
+  int npKitCtxIdx = 0;
+  uint64_t npKitDataProcessEntryTime = 0;
+  uint64_t npKitDataProcessExitTime = 0;
+  uint64_t npKitDataProcessTotalTime = 0;
+private:
+#endif
 
   // Don't use barrier 0 as it's used by the final sync
-  __device__ void barrier() {
+  inline __device__ void barrier() {
     flags |= ThreadsSynced;
-    if (nthreads == WARP_SIZE) __syncwarp();
-    else {
-      int bar = 15-group;
-      asm volatile("bar.sync %0, %1;" :: "r"(bar), "r"(nthreads) : "memory");
-    }
-  }
-  __device__ void subBarrier() {
-    if (nworkers == WARP_SIZE) __syncwarp();
-    else {
-      int bar = (nworkers==nthreads ? 15 : 8) - group;
-      asm volatile("bar.sync %0, %1;" :: "r"(bar), "r"(nworkers) : "memory");
-    }
+    if (nthreads == WARP_SIZE)
+      __syncwarp();
+    else
+      barrier_by_group();
   }
 
-  __device__ bool barrierAny(int vote) {
-    flags |= ThreadsSynced;
-    if (nthreads == WARP_SIZE) {
-      return __any_sync(~0u, vote);
-    } else {
-      int ans, bar = 15-group;
-      asm volatile(
-        "{ .reg .pred p;"
-        "  setp.ne.s32 p, %1, 0;"
-        "  bar.red.or.pred p, %2, %3, p; "
-        "  selp.s32 %0, 1, 0, p; }"
-        : "=r"(ans) : "r"(vote), "r"(bar), "r"(nthreads) : "memory");
-      return ans != 0;
-    }
-  }
-  __device__ bool subBarrierAny(int vote) {
-    if (nworkers == WARP_SIZE) {
-      return __any_sync(~0u, vote);
-    } else {
-      int ans, bar = (nworkers==nthreads ? 15 : 8) - group;
-      asm volatile(
-        "{ .reg .pred p;"
-        "  setp.ne.s32 p, %1, 0;"
-        "  bar.red.or.pred p, %2, %3, p; "
-        "  selp.s32 %0, 1, 0, p; }"
-        : "=r"(ans) : "r"(vote), "r"(bar), "r"(nworkers) : "memory");
-      return ans != 0;
-    }
+  inline __device__ void subBarrier() {
+    barrier();
   }
 
   inline __device__ bool checkAbort(int &spins) {
     spins++;
     if (!(flags & Aborted) && spins == NCCL_SPINS_BEFORE_CHECK_ABORT) {
-      if (*ncclShmem.comm.abortFlag) {
+      if (atomicAdd_system((unsigned int *)ncclShmem.comm.abortFlag, 0)) {
         flags |= Aborted;
         ncclShmem.aborted = 1;
       }
@@ -114,7 +100,11 @@ class Primitives<
     #endif
     // volatile is faster than acquire but not as correct. Make sure reduceCopy
     // loads data using volatile so it doesn't see stale data in L1.
-    return ld_volatile_global(ptr);
+#ifdef __GFX9__
+    return atomicAdd((unsigned long long *)ptr, 0);
+#else
+    return __atomic_load_n(ptr, __ATOMIC_SEQ_CST);
+#endif
   }
 
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
@@ -126,15 +116,18 @@ class Primitives<
         ((flags & (Send*RoleWaitSend)) && !noSendWait)) {
       int spins = 0;
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
+        __builtin_amdgcn_s_sleep(1);
         connStepCache = loadStepValue(connStepPtr);
         if (checkAbort(spins)) break;
         //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
+        if (spins == 0) traceData(__LINE__, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
       }
+      __asm__ __volatile__("s_wakeup");
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
       if (isSendNotRecv && (flags & SizesFifoEnabled))
-        connSizesFifoPtr[step%NCCL_STEPS] = nelts*sizeof(T);
+        __atomic_store_n(connSizesFifoPtr+step%NCCL_STEPS, nelts*sizeof(T), __ATOMIC_SEQ_CST);
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -166,10 +159,19 @@ class Primitives<
 
   template<int Recv, int Send>
   inline __device__ void postPeer(bool dataStored) {
+    if (Send && (flags & RolePostSend) && dataStored)
+#ifdef __GFX9__
+      __builtin_amdgcn_buffer_wbinvl1();
+#else
+      __threadfence_system();
+#endif
+
+    if ((flags & Send*RolePostSend) && next_hdp_reg)
+      STORE((unsigned int *)next_hdp_reg, 0x1);
+
     if (flags & (Recv*RolePostRecv | Send*RolePostSend)) {
       step += StepPerSlice;
-      if (Send && (flags & RolePostSend) && dataStored) fence_acq_rel_sys();
-      st_relaxed_sys_global(connStepPtr, step);
+      STORE(connStepPtr, step);
     }
   }
 
@@ -212,12 +214,7 @@ class Primitives<
       //     barrier();
       //     post();
       //   } // Since we no longer unroll, new branch added here
-      #if __CUDA_ARCH__ < 700
-        // Above doesn't matter on older hardware.
-        #pragma unroll SlicePerChunk
-      #else
-        #pragma unroll 1
-      #endif
+      #pragma unroll 1
       do {
         sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
         if (Src && (flags & (SrcBuf==Input ? RoleInput : RoleOutput)))
@@ -232,20 +229,90 @@ class Primitives<
         if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]) {
           // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
           if (Send) {
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY)
+            if (tid == 0) {
+              NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY, sliceSize*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+                  ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+            }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+            if (tid == 0) {
+              npKitDataProcessEntryTime = NPKIT_GET_GPU_TIMESTAMP();
+            }
+#endif
+
             reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
               (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
                1, ncclShmem.groups[group].srcs,
                fan.nsend(), ncclShmem.groups[group].dsts+1,
                workSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+            if (tid == 0) {
+              npKitDataProcessExitTime = NPKIT_GET_GPU_TIMESTAMP();
+              npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+            }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT)
+            if (tid == 0) {
+              NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT, sliceSize*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+                  ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+            }
+#endif
+
           }
         } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
           // For broadcast in CollNet to do empty send
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY, sliceSize*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessEntryTime = NPKIT_GET_GPU_TIMESTAMP();
+          }
+#endif
+
           reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
             (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
              Recv, ncclShmem.groups[group].srcs,
              Dst, ncclShmem.groups[group].dsts,
              workSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessExitTime = NPKIT_GET_GPU_TIMESTAMP();
+            npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT, sliceSize*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
         } else {
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY, sliceSize*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessEntryTime = NPKIT_GET_GPU_TIMESTAMP();
+          }
+#endif
+
           constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
                                     DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
           reduceCopy<Unroll, RedOp, T,
@@ -255,6 +322,21 @@ class Primitives<
              Recv*fan.nrecv()+Src, ncclShmem.groups[group].srcs,
              Send*fan.nsend()+Dst, ncclShmem.groups[group].dsts,
              workSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessExitTime = NPKIT_GET_GPU_TIMESTAMP();
+            npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT, sliceSize*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
         }
         barrier(); // This barrier has a counterpart in following loop
         postPeer<Recv, Send>(0 < sliceSize);
@@ -281,6 +363,50 @@ class Primitives<
     }
   }
 
+  template <int REDUCE, int COPY, int MULTISRCS, int MULTIDSTS>
+  __device__ __forceinline__ void mscclGenericOp(T** srcs, int nsrcs, T** dsts, int ndsts, int nelem) {
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_MSCCL_GENERIC_OP_ENTRY)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(NPKIT_EVENT_MSCCL_GENERIC_OP_ENTRY, nelem*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
+
+    nelem = nelem < 0 ? 0 : nelem;
+    if (tid < nworkers) {
+      if (REDUCE){
+        srcs[nsrcs] = dsts[0];
+        nsrcs++;
+        if (MULTISRCS){
+          reduceCopy<Unroll, RedOp, T, 0, 3, MSCCL_MAX_REDUCE_FUSION, 0, 1, 1, 0>
+            (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, false, nsrcs, (void **)srcs, 1, (void **)dsts, nelem);
+        } else {
+          reduceCopy<Unroll, RedOp, T, 0, 2, 2, 0, 1, 1, 0>
+            (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, false, 2, (void **)srcs, 1, (void **)dsts, nelem);
+        }
+      }
+      if (COPY){
+        reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, 0>
+          (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, false, 1, (void **)srcs, 1, (void **)dsts, nelem);
+        if (MULTISRCS) {
+          for (int i = 1; i < nsrcs; i++){
+            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, 0>
+              (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, false, 1, (void **)&srcs[i], 1, (void **)&dsts[i], nelem);
+          }
+        }
+      }
+    }
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_MSCCL_GENERIC_OP_EXIT)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(NPKIT_EVENT_MSCCL_GENERIC_OP_EXIT, nelem*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
+
+    barrier();
+  }
+
   // Scatter/Gather generic op
   // skip: my own rank order in the buffer chunks
   // shift: peer offset to avoid all ranks sending to or receiving from same peer
@@ -293,7 +419,7 @@ class Primitives<
     int sliceSize = stepSize*StepPerSlice;
     int dataSize = max(DIVUP(peerElem, 16*SlicePerChunk)*16, sliceSize/32);  // per-peer slice size
 
-    #pragma unroll
+    #pragma unroll 1
     for (int slice=0; slice<SlicePerChunk; ++slice) {
       int realSize = max(0, min(dataSize, peerElem-offset));
       bool fenceNeeded = false;
@@ -305,7 +431,7 @@ class Primitives<
           // realSize is not accurate here; but intra-node does not rely on sizes FIFO
           waitPeer<0, DirectSend, 0, 1, 1, 0>(0, inpIx, offset, realSize);
           subBarrier();
-          #pragma unroll
+          #pragma unroll 1
           // Loop over peers
           for (int j=0; j<fan.nsend(); j++) {
             int i = (j+shift)%fan.nsend();
@@ -315,7 +441,7 @@ class Primitives<
             void* src0 = (T*)ncclShmem.groups[group].srcs[0] + pOffset;
             int realPeerSize = min(realSize, totalElem-pOffset);
             if (realPeerSize > 0 && ncclShmem.groups[group].dsts[i] != nullptr) {
-              reduceCopy<Unroll, RedOp, T, 0,1,1, 0,1,1, PreOpSrcs>(tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, false, 1, &src0, 1, ncclShmem.groups[group].dsts+i, realPeerSize);
+              reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, PreOpSrcs>(tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, false, 1, &src0, 1, ncclShmem.groups[group].dsts+i, realPeerSize);
               // Mark for threadfence at the end
               fenceNeeded |= true;
             }
@@ -327,7 +453,7 @@ class Primitives<
           // Adjust remote index with peer offset in case we are directly pulling from peer's output buffer
           waitPeer<DirectRecv, 0, 1, 0, 0, 1>(outIx, outIx+pOffset, offset, realSize);
           subBarrier();
-          #pragma unroll
+          #pragma unroll 1
           for (int j=0; j<fan.nrecv(); j++) {
             int i = (j+shift)%fan.nrecv();
             pOffset = i*peerOffset;
@@ -339,7 +465,7 @@ class Primitives<
           }
         }
       }
-      fenceNeeded = barrierAny(fenceNeeded);
+      fenceNeeded = __any(fenceNeeded);
       postPeer<Recv, Send>(fenceNeeded);
       offset += realSize;
     }
@@ -352,7 +478,7 @@ class Primitives<
       step = roundUp(step, SlicePerChunk*StepPerSlice);
       if (flags & RolePostRecv) {
         connStepPtr = conn->head;
-        *connStepPtr = step; // Return credits in case we rounded up.
+        STORE(connStepPtr, step); // Return credits in case we rounded up.
       }
       if (flags & RoleWaitRecv) {
         ncclShmem.groups[group].recvConns[index] = conn; // WaitRecv role saves since that's who needs it in setDataPtrs()
@@ -393,6 +519,7 @@ class Primitives<
       step = roundUp(step, SlicePerChunk*StepPerSlice);
       if (flags & RolePostSend) {
         connStepPtr = conn->tail;
+	    next_hdp_reg = conn->next_hdp_reg;
       }
       if (flags & RoleWaitSend) {
         ncclShmem.groups[group].sendConns[index] = conn; // WaitSend role saves since that's who needs it in setDataPtrs()
@@ -431,7 +558,7 @@ class Primitives<
   }
 
  public:
-  __device__ Primitives(
+  __forceinline__ __device__ Primitives(
       int tid, int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,
       uint8_t connIndexRecv = 0, uint8_t connIndexSend = 0, struct ncclWorkElem* e = nullptr
@@ -440,7 +567,9 @@ class Primitives<
     stepSize(ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T)) {
 
     // For send operations, we need an extra warp to overlap the threadfence and the copy
-    this->nworkers = nthreads - (MaxSend > 0 && nthreads-WARP_SIZE >= 64 ? WARP_SIZE : 0);
+    barriers = &ncclShmem.groups[group].barrier;
+    barrier_next = ncclShmem.groups[group].barrier_next;
+    this->nworkers = nthreads;
 
     int nrecv=0, nsend=0;
     while (nrecv < MaxRecv && recvPeers[nrecv] != -1) nrecv++;
@@ -476,7 +605,7 @@ class Primitives<
     setDataPtrs(inputBuf, outputBuf, redOpArg, (struct ncclWorkElemReg*)e);
   }
 
-  __device__ ~Primitives() {
+  __forceinline__ __device__ ~Primitives() {
     // Ensure ncclShmem.groups[].send/recvConns are available
     if (!(flags & ThreadsSynced))
       barrier();
@@ -506,7 +635,7 @@ class Primitives<
       int spins = 0;
       void *volatile *slot = ncclShmem.groups[group].recvConns[index]->ptrExchange;
       // Wait for consumer to consume previous value before trampling it.
-      while (*slot != nullptr && !checkAbort(spins));
+      while ((void *)atomicAdd((unsigned long long *) slot,0) != nullptr && !checkAbort(spins));
       directBuff = (T*)outputBuf;
       // Encode pointer by XOR'ing against some address they definitely wouldn't send
       // since we want to allow them sending us nullptr while not colliding with
@@ -518,7 +647,7 @@ class Primitives<
       void *volatile *slot = ncclShmem.groups[group].sendConns[index]->ptrExchange;
       void *ptr;
       while (true) {
-        ptr = *slot;
+        ptr = (void *)atomicAdd((unsigned long long *) slot,0);
         if (ptr != nullptr || checkAbort(spins)) break;
       }
       directBuff = regUsed ? (T*)(e->dnOutputs[index]) :
@@ -531,7 +660,7 @@ class Primitives<
       volatile uint64_t* argSlot0 = ncclShmem.groups[group].sendConns[index]->redOpArgExchange;
       volatile uint64_t* argSlot1 = ncclShmem.groups[group].sendConns[index]->redOpArgExchange+1;
       // Wait for consumer to consume previous value before trampling it.
-      while ((*slot != nullptr || *argSlot0 != 0 || *argSlot1 !=0) && !checkAbort(spins));
+      while (((void *)atomicAdd((unsigned long long *) slot,0) != nullptr || *argSlot0 != 0 || *argSlot1 !=0) && !checkAbort(spins));
       // If there is no recv, then we are directly pulling from input buffer (e.g. directScatter)
       // Otherwise, we are pulling from output buffer (e.g. recvCopyDirectSend)
       directBuff = MaxRecv == 0 ? (T*)inputBuf : (T*)outputBuf;
@@ -550,7 +679,7 @@ class Primitives<
       volatile uint64_t* argSlot1 = ncclShmem.groups[group].recvConns[index]->redOpArgExchange+1;
       void *ptr;
       while (true) {
-        ptr = *slot;
+        ptr = (void *)atomicAdd((unsigned long long *) slot,0);
         if (ptr != nullptr || checkAbort(spins)) break;
       }
       directBuff = regUsed ? (T*)(MaxSend == 0 ? e->upOutputs[index] : e->dnInputs[index]) :
@@ -573,6 +702,12 @@ class Primitives<
   __device__ void moveDataPtrs(intptr_t delta) {
     if (flags & (RoleInput|RoleOutput))
       userBuff += delta;
+  }
+
+  // Set MSCCL data pointers
+  __device__ __forceinline__ void setDataPtrs(void const *inputBuf, void *outputBuf) {
+    if (flags & RoleInput) userBuff = (T*)inputBuf;
+    if (flags & RoleOutput) userBuff = (T*)outputBuf;
   }
 
   __device__ __forceinline__ void send(intptr_t inpIx, int eltN) {
@@ -650,5 +785,20 @@ class Primitives<
   __device__ __forceinline__ void
   directGather(intptr_t outIx, int totalElem, int peerElem, int peerOffset, int skip, int shift) {
     ScatterGatherOp<1, 0, 1, 0>(-1, outIx, totalElem, peerElem, peerOffset, skip, shift, /*postOp=*/false);
+  }
+
+  // MSCCL primitives
+  __device__ __forceinline__ void sendWithBarrier(intptr_t inpIx, int eltN) {
+    send(inpIx, eltN);
+  }
+  __device__ __forceinline__ void localCopy(T* srcs, T* dsts, int eltN) {
+    return mscclGenericOp<0,1,0,0>(&srcs, 1, &dsts, 1, eltN);
+  }
+  __device__ __forceinline__ void reduce(T** srcs, int nsrcs, T** dsts, int ndsts, int eltN) {
+    if (nsrcs == 1) {
+      return mscclGenericOp<1,0,0,0>(srcs, 1, dsts, 1, eltN);
+    } else {
+      return mscclGenericOp<1,0,1,0>(srcs, nsrcs, dsts, 1, eltN);
+    }
   }
 };

@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -8,12 +9,17 @@
 #define NCCL_DEVICE_H_
 
 #include "nccl.h"
+#include "rccl_bfloat16.h"
 #include "align.h"
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit_struct.h"
+#endif
 #include <stdint.h>
 
-#define NCCL_NUM_FUNCTIONS 5 // Send/Recv not included for now
-typedef enum { ncclFuncBroadcast, ncclFuncReduce, ncclFuncAllGather, ncclFuncReduceScatter, ncclFuncAllReduce, ncclFuncSendRecv, ncclFuncSend, ncclFuncRecv, ncclNumFuncs} ncclFunc_t;
-extern const char* ncclFuncStr[NCCL_NUM_FUNCTIONS];
+
+#define NCCL_NUM_FUNCTIONS 5 // SendRecv and AllToAllPivot not included for now
+typedef enum { ncclFuncBroadcast, ncclFuncReduce, ncclFuncAllGather, ncclFuncReduceScatter, ncclFuncAllReduce, ncclFuncSendRecv, ncclFuncSend, ncclFuncRecv, ncclFuncAllToAllPivot, ncclNumFuncs} ncclFunc_t;
+extern const char* ncclFuncStr[NCCL_NUM_FUNCTIONS+2];
 
 #define NCCL_NUM_ALGORITHMS 6 // Tree/Ring/CollNet*
 #define NCCL_ALGO_TREE 0
@@ -48,11 +54,11 @@ union ncclLLFifoLine {
   int4 i4;
 };
 
-#define WARP_SIZE 32
+#define WARP_SIZE warpSize
 #define MAXCHANNELS 32
-#define NCCL_MAX_NTHREADS 640
-#define NCCL_SIMPLE_MAX_NTHREADS 512
-#define NCCL_LL_MAX_NTHREADS 512
+#define NCCL_MAX_NTHREADS 256
+#define NCCL_SIMPLE_MAX_NTHREADS NCCL_MAX_NTHREADS
+#define NCCL_LL_MAX_NTHREADS NCCL_MAX_NTHREADS
 #define NCCL_LL_LINES_PER_THREAD 8
 #ifdef TEST_LL_CLEANUP
 #define NCCL_LL_CLEAN_MASK 0x078 // Set to 0x100 to disable cleanup
@@ -65,14 +71,14 @@ union ncclLLFifoLine {
 // Make sure the clean mask will last for at least NCCL_NSTEPS
 static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK value");
 
-#define NCCL_LL128_LINESIZE 128
+#define NCCL_LL128_LINESIZE 64
 #define NCCL_LL128_LINEELEMS (NCCL_LL128_LINESIZE/sizeof(uint64_t))
 #define NCCL_LL128_DATAELEMS (NCCL_LL128_LINEELEMS-1)
 
-#define NCCL_LL128_MAX_NTHREADS 640
-#define NCCL_LL128_ELEMS_PER_THREAD 120
+#define NCCL_LL128_MAX_NTHREADS 256
+#define NCCL_LL128_ELEMS_PER_THREAD 28
 
-#define NCCL_LL128_SHMEM_ELEMS_PER_THREAD 8
+#define NCCL_LL128_SHMEM_ELEMS_PER_THREAD 4
 #define NCCL_LL128_SHMEM_SIZE (NCCL_LL128_SHMEM_ELEMS_PER_THREAD*NCCL_LL128_MAX_NTHREADS)
 
 #define NCCL_DIRECT_WRITE 0x01
@@ -98,6 +104,12 @@ struct ncclConnInfo {
 
   uint64_t step;      // Keep where we are
   uint64_t llLastCleaning;
+
+  // GPU's HDP_MEM_FLUSH_ADDR: HDP Memory Coherency Flush Control. This register
+  // allows software to explicitly initiate a flush read to HDP memory. See more
+  // descriptions in primitives.h.
+  uint32_t* next_hdp_reg;  // Next GPU in ring (for p2p transport use only)
+  uint32_t* curr_hdp_reg;  // Current GPU's HDP register
 };
 
 struct ncclProxyConnector {
@@ -150,6 +162,7 @@ struct ncclDirect {
   int down[NCCL_MAX_DIRECT_ARITY];
 };
 
+#define NCCL_CONN_IDX_P2P_NET 2
 #define NCCL_MAX_NVLS_ARITY 8
 #define NCCL_MAX_NVLS_TREE_ARITY 3
 struct ncclNvls {
@@ -164,7 +177,7 @@ struct ncclNvls {
   int nNodes;
 };
 
-#define NCCL_MAX_CONNS 2
+#define NCCL_MAX_CONNS 3
 struct ncclChannelPeer {
   struct ncclConnector send[NCCL_MAX_CONNS];
   struct ncclConnector recv[NCCL_MAX_CONNS];
@@ -173,10 +186,12 @@ struct ncclChannelPeer {
 
 struct ncclDevComm;
 
+#pragma pack(push)  /* push current alignment to stack */
+#pragma pack(8)     /* set alignment to 8 bytes boundary */
 /* ncclWork is to be a power of two, currently 8x64 bytes, */
 /* to make sure reads to host from the CUDA kernel are aligned. */
 /* Make sure to adjust padding at the end of ncclWorkElem. */
-#define NCCL_WORK_SIZE 512
+#define NCCL_WORK_SIZE 256
 
 enum ncclWorkType : uint8_t {
    ncclWorkTypeUnused=0,
@@ -205,34 +220,51 @@ struct ncclWorkElem {
   union {
     uint8_t flagBits;
     struct {
-      uint8_t isUsed:1, redOpArgIsPtr:1, regUsed:1;
+      uint8_t isUsed:1, redOpArgIsPtr:1, regUsed:1, nWarps:5;
     };
   };
-  uint8_t nWarps;
   uint8_t direct;
+  uint8_t bid;
+  uint8_t nChannels;
+  struct {
+    uint32_t root:28;
+    uint32_t pad_0:2;
+    uint32_t connIndex:2;
+  };
 
   const void * sendbuff;
   void * recvbuff;
 
   size_t count;
-  size_t lastChunkSize;
-  uint32_t root;
-  uint8_t bid;
-  uint8_t nChannels;
+  union {
+    size_t lastChunkSize;
+    // Pivot A2A kernel computes chunk size itself.
+    // Instead, it needs the number of bidirectional rings.
+    size_t pivotA2ANumBiRings;
+  };
   uint64_t redOpArg;
+  uint64_t opCount;
 };
 
-#define NCCL_MAX_WORK_ELEMENTS ((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElem)))/sizeof(ncclWorkElem))
-static_assert(NCCL_MAX_WORK_ELEMENTS == 9, "Sanity check: NCCL_MAX_WORK_ELEMENTS == 9");
+static_assert((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElem)))/sizeof(ncclWorkElem) == 4, "Sanity check: NCCL_MAX_WORK_ELEMENTS == 4");
+#define NCCL_MAX_WORK_ELEMENTS 1
 
 struct ncclWorkElemP2p {
-  int peer : 30;
-  int proto : 2;
-
-  enum ncclWorkP2PType p2pType;
-  uint8_t nWarps;
-  uint8_t warpStart;
-  uint8_t ngroups;
+  struct {
+    int32_t peer:28;
+    uint32_t connIndex:2;
+    int32_t proto:2;
+  };
+  union {
+    uint16_t flagBits;
+    struct {
+      enum ncclWorkP2PType p2pType:4;
+      uint16_t nWarps:4;
+      uint16_t warpStart:4;
+      uint16_t ngroups:4;
+    };
+  };
+  uint16_t opCount;
   // Important not to use any fields with greater than 4-byte alignment since
   // we need sizeof(ncclWorkElemP2p)==28, but that would be padded up to 32 if
   // there were 8-byte fields.
@@ -243,8 +275,8 @@ struct ncclWorkElemP2p {
   int chunkSize;
 };
 
-static_assert(((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemP2p)))/sizeof(ncclWorkElemP2p)) >= 16, "Sanity check: NCCL_MAX_WORK_ELEMENTS_P2P == 16");
-#define NCCL_MAX_WORK_ELEMENTS_P2P 16
+static_assert(((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemP2p)))/sizeof(ncclWorkElemP2p)) == 8, "Sanity check: NCCL_MAX_WORK_ELEMENTS_P2P == 8");
+#define NCCL_MAX_WORK_ELEMENTS_P2P 2
 
 struct ncclWorkElemReg {
   struct ncclWorkElem elem;
@@ -254,10 +286,10 @@ struct ncclWorkElemReg {
 };
 
 #define NCCL_MAX_WORK_ELEMENTS_REG ((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemReg)))/sizeof(ncclWorkElemReg))
-static_assert(NCCL_MAX_WORK_ELEMENTS_REG == 2, "Sanity check: NCCL_MAX_WORK_ELEMENTS_REG == 2");
+static_assert(NCCL_MAX_WORK_ELEMENTS_REG == 1, "Sanity check: NCCL_MAX_WORK_ELEMENTS_REG == 1");
 
 // Number of named barriers supported by CUDA
-#define NCCL_MAX_GROUPS 16
+#define NCCL_MAX_GROUPS (NCCL_MAX_NTHREADS/WARP_SIZE)
 
 struct ncclWork {
   struct ncclWorkHeader header;
@@ -276,7 +308,72 @@ struct ncclDevChannelPeer {
   // instead of the full ncclConnector.
   struct ncclConnInfo send[NCCL_MAX_CONNS];
   struct ncclConnInfo recv[NCCL_MAX_CONNS];
+
 };
+#pragma pack(pop)   /* restore original alignment from stack */
+
+#ifdef ENABLE_PROFILING
+#define PROFILE_NUM_ITEMS 31
+#define PROFILE_NUM_LAUNCHES 1024
+
+struct ncclProf {
+  uint32_t count;
+  uint32_t seq; // only entry from first launch is used
+  struct {
+    uint64_t line:16;
+    uint64_t timeStamp:48;
+  } elem[PROFILE_NUM_ITEMS];
+};
+static_assert(sizeof(struct ncclProf) == 256, "ncclProf must have size of 256");
+#endif
+
+#ifdef ENABLE_COLLTRACE
+typedef enum {
+  ncclCollTraceNotReady = 0,
+  ncclCollTraceKernelLaunchType = 1,
+  ncclCollTraceKernelEndType = 2,
+  ncclCollTraceCollLaunchType = 3,
+  ncclCollTraceAbortType = 4,
+  ncclCollTraceDataType = 5,
+  ncclCollTraceCollElemType = (1<<4),
+  ncclCollTraceP2pElemType = (1<<5),
+} ncclCollTraceDataType_t;
+
+struct ncclCollTrace {
+  uint8_t type;
+  uint8_t bid;
+  int16_t funcIndex;
+  uint32_t data_0;
+  uint64_t timeStamp;
+  union {
+    uint64_t opCount;
+    uint32_t p2pOpCount[2];
+  };
+  union {
+    uint64_t data_1;
+    struct {
+      uint8_t nWarps;
+      uint8_t bid;
+      uint8_t nChannels;
+    } coll;
+    struct {
+      int16_t peer;
+      uint8_t ngroups:4;
+      uint8_t connIndex:4;
+      uint8_t warpStart:4;
+      uint8_t nWarps:4;
+    } p2p[2];
+  };
+};
+static_assert(sizeof(struct ncclCollTrace) == 8*sizeof(int), "ncclCollTrace must have a pow2 size");
+
+union ncclCollTraceTail{
+  uint32_t tail;
+  char padding[4096];
+};
+
+#define COLLTRACE_NUM_ITEMS 8192
+#endif
 
 struct alignas(16) ncclDevChannel {
   struct ncclDevChannelPeer** peers;
@@ -284,6 +381,7 @@ struct alignas(16) ncclDevChannel {
   struct ncclTree tree;
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
+  struct ncclTree binTree;
   struct ncclNvls nvls;
   uint32_t* workFifoDone; // Location of done counter, device writes index+1 of last work processed
 };
@@ -302,6 +400,21 @@ struct ncclDevComm {
 
   // Channels, device side
   struct ncclDevChannel* channels/*[MAXCHANNELS]*/;
+
+#if defined(ENABLE_NPKIT)
+  NpKitEventCollectContext* npKitEventCollectContexts;
+  uint64_t* cpuTimestamp;
+#endif
+
+#ifdef ENABLE_COLLTRACE
+  struct ncclCollTrace* collTrace;
+  union ncclCollTraceTail *collTraceTail;
+  pthread_t collTraceThread;
+#endif
+
+#ifdef ENABLE_PROFILING
+  struct ncclProf* devProf;
+#endif
 };
 
 struct alignas(16) ncclDevCommAndChannels {

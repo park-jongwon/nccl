@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2019-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -62,7 +63,7 @@ struct ncclInfo {
 
 inline ncclResult_t ncclInfoSetDerived(struct ncclInfo* info, int nRanks) {
   info->nBytes = info->count * ncclTypeSize(info->datatype);
-  if (info->coll == ncclFuncAllGather || info->coll == ncclFuncBroadcast) {
+  if (info->coll == ncclFuncAllGather || info->coll == ncclFuncBroadcast || info->coll == ncclFuncAllToAllPivot) {
     info->count = info->nBytes;
     info->datatype = ncclInt8;
   }
@@ -109,6 +110,8 @@ struct ncclTasks {
 
   // The list of user streams aggregated over all tasks present.
   struct ncclCudaStreamList* streams;
+  // Keep track of the number of user streams
+  int numStreams;
   // The most recent user stream. Ignored if streams==nullptr
   cudaStream_t streamRecent;
   // The graph capturing all user streams or invalid if none. Thus we restrict the

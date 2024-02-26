@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -35,8 +36,8 @@ struct ncclComm;
 struct ncclPeerInfo {
   int rank;
   int cudaDev;
-  int nvmlDev;
   int gdrSupport;
+  bool hasFineGrain;
   uint64_t hostHash;
   uint64_t pidHash;
   dev_t shmDev;
@@ -100,7 +101,7 @@ struct ncclTransport {
 };
 
 ncclResult_t ncclTransportP2pConnect(struct ncclComm* comm, int channelId, int nrecv, int* peerRecv, int nsend, int* peerSend, int connIndex);
-ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex, int* highestTransportType=NULL);
+ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex, int* highestTransportType=NULL, bool* needsProxy=NULL);
 
 ncclResult_t ncclNvlsInit(struct ncclComm* comm);
 ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent);

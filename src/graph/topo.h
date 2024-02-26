@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -9,6 +10,8 @@
 
 #include "graph.h"
 #include "core.h"
+#include "archinfo.h"
+#include <string.h>
 
 #define LOC_BW 5000.0
 #define SM60_NVLINK_BW 18.0
@@ -24,6 +27,9 @@
 #define P9_BW 32.0
 #define ARM_BW 6.0
 #define NET_BW 12.0           // 100Gbit
+#define VEGA_XGMI_WIDTH 24.0
+#define MI200_XGMI_WIDTH 36.0
+#define GFX94X_XGMI_WIDTH 48.0
 
 // Intel CPU convert GPU P2P traffic into 64B PCI TLPs, so GPU
 // to GPU traffic consumes more PCI bandwidth.
@@ -102,6 +108,13 @@ struct ncclTopoLinkList {
 
 #define NCCL_TOPO_UNDEF (-1)
 
+#define RCCL_TOPO_CR8G      1
+#define RCCL_TOPO_4P2H_ROME 2
+#define RCCL_TOPO_GDR_ALL   4
+#define RCCL_TOPO_16P1H     8
+#define RCCL_TOPO_FORCE_INTRA 16
+#define RCCL_TOPO_XGMI_ALL  32
+
 struct ncclTopoNode {
   int type;
   int64_t id;
@@ -112,6 +125,8 @@ struct ncclTopoNode {
       int rank;
       int cudaCompCap;
       int gdrSupport;
+      const char* gcn;
+      hipDeviceArch_t arch;
     }gpu;
     struct {
       uint64_t asic;
@@ -121,6 +136,7 @@ struct ncclTopoNode {
       int gdrSupport;
       int collSupport;
       int maxChannels;
+      int64_t busId;
     }net;
     struct {
       int arch;
@@ -149,6 +165,17 @@ struct ncclTopoSystem {
   struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES];
   float maxBw;
   float totalBw;
+  int type;
+  int nRanks;
+  int netGdrLevel;
+  int tuning;
+
+  bool pivotA2AEnabled;
+  int pivotA2ANumBiRings;
+  bool treeDefined;
+  bool ll128Enabled;
+  float baseBw;
+  bool mscclEnabled;
 };
 
 ncclResult_t ncclTopoGetNode(struct ncclTopoSystem* system, struct ncclTopoNode** node, int type, uint64_t id);
@@ -198,24 +225,20 @@ static ncclResult_t ncclTopoDevToRank(struct ncclTopoSystem* system, int dev, in
   return ncclInternalError;
 }
 
-// Returns NVLink bw in GB/s
-static float ncclTopoNVLinkBw(int cudaCompCap) {
-  return
-    cudaCompCap >= 90 ? SM90_NVLINK_BW :
-    cudaCompCap == 86 ? SM86_NVLINK_BW :
-    cudaCompCap >= 80 ? SM80_NVLINK_BW :
-    cudaCompCap >= 70 ? SM70_NVLINK_BW :
-    cudaCompCap >= 60 ? SM60_NVLINK_BW :
-    SM80_NVLINK_BW;
+// Returns XGMI speed in GB/s
+static float ncclTopoXGMISpeed(const char* gcn) {
+  if (IsArchMatch(gcn, "gfx90a"))
+    return MI200_XGMI_WIDTH;
+  else if (IsArchMatch(gcn, "gfx94"))
+    return GFX94X_XGMI_WIDTH;
+  else
+    return VEGA_XGMI_WIDTH;
 }
 
-// Mirror bits
-static bool isPow2(int val) {
-  return (val & (val-1)) == 0;
-}
-static int mirrorBits(int val, int pow2) {
-  int mirror = 0;
-  for (int b=1, mb=(pow2>>1); b<pow2; b<<=1, mb>>=1) if (val & b) mirror |= mb;
-  return mirror;
-}
+#if ENABLE_COLLTRACE
+  #define ncclGetKernelIndex(p_comm) ((p_comm)->collTraceThread ? 1 : 0)
+#else
+  #define ncclGetKernelIndex(p_comm) (0)
+#endif
+
 #endif

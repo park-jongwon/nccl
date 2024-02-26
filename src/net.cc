@@ -1,3 +1,10 @@
+/*************************************************************************
+ * Copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2022 Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE.txt for license information
+ ************************************************************************/
+
 #include "net.h"
 #include "bootstrap.h"
 #include "checks.h"
@@ -169,10 +176,10 @@ ncclResult_t ncclNetPluginInit() {
   char ncclNetPluginName[128];
   const char* envPluginName = getenv("NCCL_NET_PLUGIN");
   if (envPluginName && strlen(envPluginName)) {
-    snprintf(ncclNetPluginName, 128, "libnccl-net-%s.so", envPluginName);
+    snprintf(ncclNetPluginName, 128, "librccl-net-%s.so", envPluginName);
     INFO(NCCL_INIT, "Plugin name set by env to %s", ncclNetPluginName);
   } else {
-    sprintf(ncclNetPluginName, "libnccl-net.so");
+    sprintf(ncclNetPluginName, "librccl-net.so");
   }
   void* netPluginLib = dlopen(ncclNetPluginName, RTLD_NOW | RTLD_LOCAL);
   if (netPluginLib == nullptr) {
@@ -314,6 +321,10 @@ ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport) {
       ncclNetProperties_t props;
       NCCLCHECK(comm->ncclNet->getProperties(dev, &props));
       if ((props.ptrSupport & NCCL_PTR_CUDA) == 0) continue;
+#if defined(__HIP_PLATFORM_HCC__) || defined(__HCC__) || defined(__HIPCC__)
+      gdrSupportMatrix[comm->cudaDev] = 1;
+      break;
+#endif
 
     // Allocate memory on the GPU and try to register it on the NIC.
     void *lComm = NULL, *sComm = NULL, *rComm = NULL;

@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -10,7 +11,11 @@
 
 namespace {
   template<typename T, typename RedOp, typename Proto>
-  __device__ __forceinline__ void runRing(ncclWorkElem *args) {
+#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx940__) && !defined(__gfx941__) && !defined(__gfx942__)
+  __device__ void runRing(ncclWorkElem *args) {
+#else
+  __device__ __attribute__((noinline)) void runRing(ncclWorkElem *args) {
+#endif
     const int tid = threadIdx.x;
     const int nthreads = args->nWarps*WARP_SIZE;
     const int bid = args->bid;
@@ -24,16 +29,48 @@ namespace {
     const ssize_t loopSize = nChannels*int(chunkSize);
     const ssize_t size = args->count;
 
+#if defined(ENABLE_NPKIT)
+    int npKitCtxIdx = bid;
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_TIME_SYNC_CPU)
+    if (tid == 0) {
+      uint64_t* cpuTimestamp = ncclShmem.comm.cpuTimestamp;
+      NpKit::CollectGpuEvent(NPKIT_EVENT_TIME_SYNC_CPU, 0, 0, *cpuTimestamp,
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_TIME_SYNC_GPU)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(NPKIT_EVENT_TIME_SYNC_GPU, 0, 0, NPKIT_GET_GPU_TIMESTAMP(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_ENTRY)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_ENTRY, size*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
+
     T *inputBuf = (T*)args->sendbuff;
     T *outputBuf = (T*)args->recvbuff;
-    Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
-      (tid, nthreads, &ring->prev, &ring->next, inputBuf, outputBuf, args->redOpArg);
+    Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0> prims
+      (tid, nthreads, &ring->prev, &ring->next, inputBuf, outputBuf, args->redOpArg, 0, args->connIndex, args->connIndex);
+
+#if defined(ENABLE_NPKIT)
+    if (tid == 0) {
+      prims.npKitCtxIdx = npKitCtxIdx;
+    }
+#endif
 
     for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
       ssize_t realChunkSize;
       if (Proto::Id == NCCL_PROTO_SIMPLE) {
         realChunkSize = min(chunkSize, divUp(size-gridOffset,nChannels));
-        realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
+        realChunkSize = roundUp(realChunkSize, nthreads*sizeof(uint64_t)/sizeof(T));
       }
       else if (Proto::Id == NCCL_PROTO_LL)
         realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;
@@ -52,11 +89,34 @@ namespace {
       rankDest = ringRanks[0];
       offset = chunkOffset + rankDest * size;
 
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_SEND_ENTRY)
+      if (tid == 0) {
+        NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_SEND_ENTRY, nelem*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+            ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+        prims.npKitDataProcessTotalTime = 0;
+      }
+#endif
+
       if (inputBuf + chunkOffset == outputBuf + offset) { // In place
         prims.directSend(chunkOffset, offset, nelem);
       } else {
         prims.directCopySend(chunkOffset, offset, nelem);
       }
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_SEND_EXIT)
+      if (tid == 0) {
+        NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_SEND_EXIT, nelem*sizeof(T), prims.npKitDataProcessTotalTime, NPKIT_GET_GPU_TIMESTAMP(),
+            ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+      }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_RECV_COPY_SEND_ENTRY)
+      if (tid == 0 && nranks > 2) {
+        NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_RECV_COPY_SEND_ENTRY, nelem*(nranks-2)*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+            ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+        prims.npKitDataProcessTotalTime = 0;
+      }
+#endif
 
       // k-2 steps: copy to next GPU
       for (int j=1; j<nranks-1; ++j) {
@@ -66,13 +126,43 @@ namespace {
         prims.directRecvCopySend(offset, nelem);
       }
 
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_RECV_COPY_SEND_EXIT)
+      if (tid == 0 && nranks > 2) {
+        NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_RECV_COPY_SEND_EXIT, nelem*(nranks-2)*sizeof(T), prims.npKitDataProcessTotalTime, NPKIT_GET_GPU_TIMESTAMP(),
+            ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+      }
+#endif
+
       // Make final copy from buffer to dest.
       rankDest = ringRanks[1];
       offset = chunkOffset + rankDest * size;
 
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_DIRECT_RECV_ENTRY)
+      if (tid == 0) {
+        NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_DIRECT_RECV_ENTRY, nelem*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+            ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+        prims.npKitDataProcessTotalTime = 0;
+      }
+#endif
       // Final wait/copy.
       prims.directRecv(offset, nelem);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_DIRECT_RECV_EXIT)
+      if (tid == 0) {
+        NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_DIRECT_RECV_EXIT, nelem*sizeof(T), prims.npKitDataProcessTotalTime, NPKIT_GET_GPU_TIMESTAMP(),
+            ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+      }
+#endif
+
+
+
     }
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_GATHER_RING_EXIT)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(NPKIT_EVENT_ALL_GATHER_RING_EXIT, size*sizeof(T), 0, NPKIT_GET_GPU_TIMESTAMP(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
   }
 }
 

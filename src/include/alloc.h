@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2019-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -16,6 +17,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include "rccl_vars.h"
 
 uint64_t clockNano(); // from utils.h with which we have a circular dependency
 
@@ -25,7 +27,7 @@ ncclResult_t ncclCudaHostCallocDebug(T** ptr, size_t nelem, const char *filefunc
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   *ptr = nullptr;
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-  CUDACHECKGOTO(cudaHostAlloc(ptr, nelem*sizeof(T), cudaHostAllocMapped), result, finish);
+  CUDACHECKGOTO(hipHostMalloc(ptr, nelem*sizeof(T), cudaHostAllocMapped), result, finish);
   memset(*ptr, 0, nelem*sizeof(T));
 finish:
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
@@ -72,6 +74,19 @@ ncclResult_t ncclRealloc(T** ptr, size_t oldNelem, size_t nelem) {
   INFO(NCCL_ALLOC, "Mem Realloc old size %ld, new size %ld pointer %p", oldNelem*sizeof(T), nelem*sizeof(T), *ptr);
   return ncclSuccess;
 }
+
+struct __attribute__ ((aligned(64))) allocationTracker {
+  union {
+    struct {
+      uint64_t totalAlloc;
+      uint64_t totalAllocSize;
+    };
+    char align[64];
+  };
+};
+static_assert(sizeof(struct allocationTracker) == 64, "allocationTracker must be size of 64 bytes");
+#define MAX_ALLOC_TRACK_NGPU 32
+extern struct allocationTracker allocTracker[];
 
 #if CUDART_VERSION >= 11030
 
@@ -145,68 +160,91 @@ static inline ncclResult_t ncclCuMemFree(void *ptr) {
 #endif
 
 template <typename T>
-ncclResult_t ncclCudaMallocDebug(T** ptr, size_t nelem, const char *filefunc, int line) {
+ncclResult_t ncclCudaMallocDebug(const char *filefunc, int line, T** ptr, size_t nelem, bool isFineGrain = false) {
   ncclResult_t result = ncclSuccess;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   *ptr = nullptr;
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-  if (ncclCuMemEnable()) {
-    NCCLCHECKGOTO(ncclCuMemAlloc((void **)ptr, NULL, nelem*sizeof(T)), result, finish);
-  } else {
+  if (isFineGrain) {
+#if defined(HIP_UNCACHED_MEMORY)
+    CUDACHECKGOTO(hipExtMallocWithFlags((void**)ptr, nelem*sizeof(T), hipDeviceMallocUncached), result, finish);
+#else
+    CUDACHECKGOTO(hipExtMallocWithFlags((void**)ptr, nelem*sizeof(T), hipDeviceMallocFinegrained), result, finish);
+#endif
+  } else
     CUDACHECKGOTO(cudaMalloc(ptr, nelem*sizeof(T)), result, finish);
-  }
 finish:
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   if (*ptr == nullptr) WARN("Failed to CUDA malloc %ld bytes", nelem*sizeof(T));
   INFO(NCCL_ALLOC, "%s:%d Cuda Alloc Size %ld pointer %p", filefunc, line, nelem*sizeof(T), *ptr);
   return result;
 }
-#define ncclCudaMalloc(...) ncclCudaMallocDebug(__VA_ARGS__, __FILE__, __LINE__)
+#define ncclCudaMalloc(...) ncclCudaMallocDebug( __FILE__, __LINE__, __VA_ARGS__)
 
 template <typename T>
-ncclResult_t ncclCudaCallocDebug(T** ptr, size_t nelem, const char *filefunc, int line) {
+ncclResult_t ncclCudaCallocDebug(const char *filefunc, int line, T** ptr, size_t nelem, cudaStream_t sideStream = nullptr, bool isFineGrain = false) {
   ncclResult_t result = ncclSuccess;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   *ptr = nullptr;
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   // Need a side stream so as not to interfere with graph capture.
-  cudaStream_t stream;
-  CUDACHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  if (ncclCuMemEnable()) {
-    NCCLCHECKGOTO(ncclCuMemAlloc((void **)ptr, NULL, nelem*sizeof(T)), result, finish);
-  } else {
+  cudaStream_t stream = sideStream;
+  if (stream == nullptr)
+    CUDACHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  if (isFineGrain) {
+#if defined(HIP_UNCACHED_MEMORY)
+    CUDACHECKGOTO(hipExtMallocWithFlags((void**)ptr, nelem*sizeof(T), hipDeviceMallocUncached), result, finish);
+#else
+    CUDACHECKGOTO(hipExtMallocWithFlags((void**)ptr, nelem*sizeof(T), hipDeviceMallocFinegrained), result, finish);
+#endif
+  } else
     CUDACHECKGOTO(cudaMalloc(ptr, nelem*sizeof(T)), result, finish);
-  }
   CUDACHECKGOTO(cudaMemsetAsync(*ptr, 0, nelem*sizeof(T), stream), result, finish);
   CUDACHECKGOTO(cudaStreamSynchronize(stream), result, finish);
-  CUDACHECKGOTO(cudaStreamDestroy(stream), result, finish);
+  if (sideStream == nullptr)
+    CUDACHECKGOTO(cudaStreamDestroy(stream), result, finish);
+  int dev;
+  CUDACHECK(hipGetDevice(&dev));
+  if (dev < MAX_ALLOC_TRACK_NGPU) {
+    __atomic_fetch_add(&allocTracker[dev].totalAlloc, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&allocTracker[dev].totalAllocSize, nelem*sizeof(T), __ATOMIC_RELAXED);
+  }
 finish:
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   if (*ptr == nullptr) WARN("Failed to CUDA calloc %ld bytes", nelem*sizeof(T));
   INFO(NCCL_ALLOC, "%s:%d Cuda Alloc Size %ld pointer %p", filefunc, line, nelem*sizeof(T), *ptr);
   return result;
 }
-#define ncclCudaCalloc(...) ncclCudaCallocDebug(__VA_ARGS__, __FILE__, __LINE__)
+#define ncclCudaCalloc(...) ncclCudaCallocDebug(__FILE__, __LINE__, __VA_ARGS__)
 
 template <typename T>
-ncclResult_t ncclCudaCallocAsyncDebug(T** ptr, size_t nelem, cudaStream_t stream, const char *filefunc, int line) {
+ncclResult_t ncclCudaCallocAsyncDebug(const char *filefunc, int line, T** ptr, size_t nelem, hipStream_t stream, bool isFineGrain = false) {
   ncclResult_t result = ncclSuccess;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   *ptr = nullptr;
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-  if (ncclCuMemEnable()) {
-    NCCLCHECKGOTO(ncclCuMemAlloc((void **)ptr, NULL, nelem*sizeof(T)), result, finish);
-  } else {
+  if (isFineGrain) {
+#if defined(HIP_UNCACHED_MEMORY)
+    CUDACHECKGOTO(hipExtMallocWithFlags((void**)ptr, nelem*sizeof(T), hipDeviceMallocUncached), result, finish);
+#else
+    CUDACHECKGOTO(hipExtMallocWithFlags((void**)ptr, nelem*sizeof(T), hipDeviceMallocFinegrained), result, finish);
+#endif
+  } else
     CUDACHECKGOTO(cudaMalloc(ptr, nelem*sizeof(T)), result, finish);
-  }
   CUDACHECKGOTO(cudaMemsetAsync(*ptr, 0, nelem*sizeof(T), stream), result, finish);
+  int dev;
+  CUDACHECK(hipGetDevice(&dev));
+  if (dev < MAX_ALLOC_TRACK_NGPU) {
+    __atomic_fetch_add(&allocTracker[dev].totalAlloc, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&allocTracker[dev].totalAllocSize, nelem*sizeof(T), __ATOMIC_RELAXED);
+  }
 finish:
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   if (*ptr == nullptr) WARN("Failed to CUDA calloc async %ld bytes", nelem*sizeof(T));
   INFO(NCCL_ALLOC, "%s:%d Cuda Alloc Size %ld pointer %p", filefunc, line, nelem*sizeof(T), *ptr);
   return result;
 }
-#define ncclCudaCallocAsync(...) ncclCudaCallocAsyncDebug(__VA_ARGS__, __FILE__, __LINE__)
+#define ncclCudaCallocAsync(...) ncclCudaCallocAsyncDebug(__FILE__, __LINE__, __VA_ARGS__)
 
 template <typename T>
 ncclResult_t ncclCudaMemcpy(T* dst, T* src, size_t nelem) {

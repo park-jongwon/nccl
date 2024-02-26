@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include "proxy.h"
+#include "signals.h" // [RCCL]
 
 struct bootstrapRootArgs {
   struct ncclSocket* listenSock;
@@ -242,6 +243,10 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
   comm->magic = state->magic = handle->magic;
 
   TRACE(NCCL_INIT, "rank %d nranks %d", rank, nranks);
+
+  // [RCCL] Register custom signal handlers if requested
+  RegisterSignalHandlers();
+  // [/RCCL]
 
   info.rank = rank;
   info.nranks = nranks;

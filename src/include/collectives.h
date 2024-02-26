@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2017-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -18,8 +19,9 @@ struct ncclDevRedOpFull {
   uint64_t scalarArg;
 };
 
-#define FUNC_INDEX_P2P 0
-#define FUNC_INDEX(func, devredop, ncclType, al, pr) (1+ncclNumTypes+(((((func)*ncclNumDevRedOps + (devredop))*ncclNumTypes) + (ncclType))*NCCL_NUM_ALGORITHMS+(al))*NCCL_NUM_PROTOCOLS+(pr))
+#define FUNC_INDEX_P2P (ncclNumTypes+NCCL_NUM_FUNCTIONS*NCCL_NUM_ALGORITHMS*NCCL_NUM_PROTOCOLS*ncclNumTypes*ncclNumDevRedOps)
+#define FUNC_INDEX_ALLTOALL_PIVOT (FUNC_INDEX_P2P+1)
+#define FUNC_INDEX(func, devredop, ncclType, al, pr) ((((((func)*ncclNumDevRedOps + (devredop))*ncclNumTypes) + (ncclType))*NCCL_NUM_ALGORITHMS+(al))*NCCL_NUM_PROTOCOLS+(pr))
 
 #define NCCL_FUNC_NAME(func, algo, proto, devredop, type) \
   ncclFunction_##func##_##algo##_##proto##_##devredop##_##type
@@ -30,13 +32,24 @@ struct ncclDevRedOpFull {
 #define NCCL_KERN_NAME(func, algo, proto, devredop, type) \
   ncclKernel_##func##_##algo##_##proto##_##devredop##_##type
 
+#define NCCL_KERN_NAME_DEBUG(func, algo, proto, devredop, type) \
+  ncclKernelDebug_##func##_##algo##_##proto##_##devredop##_##type
+
 #define NCCL_IMPL_NAME(func, algo, proto) \
   nccl##func##algo##proto
 
 /* Declare all collective operations */
+#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx940__) && !defined(__gfx941__) && !defined(__gfx942__)
 #define DECL5(func, algo, proto, devredop, type) \
   extern __device__ void NCCL_FUNC_NAME(func, algo, proto, devredop, type)(); \
   extern __global__ void NCCL_KERN_NAME(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead); \
+  extern __global__ void NCCL_KERN_NAME_DEBUG(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead);
+#else
+#define DECL5(func, algo, proto, devredop, type) \
+  extern __device__ __attribute__((noinline)) void NCCL_FUNC_NAME(func, algo, proto, devredop, type)(); \
+  extern __global__ void NCCL_KERN_NAME(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead); \
+  extern __global__ void NCCL_KERN_NAME_DEBUG(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead);
+#endif
 
 #define SINGLE_ARG(...) __VA_ARGS__
 #define CONCAT(a,b) a##b
@@ -57,7 +70,7 @@ struct ncclDevRedOpFull {
   DECL4(func, NVLS,           devredop, type, undef) \
   DECL4(func, NVLS_TREE,      devredop, type, undef)
 
-#if defined(__CUDA_BF16_TYPES_EXIST__)
+#if defined(RCCL_BFLOAT16)
 #define DECL2(func, devredop, undefForFloat) \
   DECL3(func, devredop, int8_t, /*undef=*/0) \
   DECL3(func, devredop, uint8_t, /*undef=*/0) \
@@ -68,7 +81,7 @@ struct ncclDevRedOpFull {
   DECL3(func, devredop, half, /*undef=*/undefForFloat) \
   DECL3(func, devredop, float, /*undef=*/undefForFloat) \
   DECL3(func, devredop, double, /*undef=*/undefForFloat) \
-  DECL3(func, devredop, __nv_bfloat16, /*undef=*/undefForFloat)
+  DECL3(func, devredop, rccl_bfloat16, /*undef=*/undefForFloat)
 #else
 #define DECL2(func, devredop, undefForFloat) \
   DECL3(func, devredop, int8_t, /*undef=*/0) \
@@ -96,6 +109,7 @@ DECL2(AllGather, Sum, /*undefForFloat=*/0)
 DECL(ReduceScatter)
 DECL(AllReduce)
 DECL5(SendRecv, RING, SIMPLE, Sum, int8_t)
+DECL5(AllToAllPivot, RING, SIMPLE, Sum, int8_t)
 
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, int8_t)();
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, uint8_t)();
@@ -104,8 +118,8 @@ extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, uint32_t)();
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, int64_t)();
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, uint64_t)();
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, half)();
-#if defined(__CUDA_BF16_TYPES_EXIST__)
-extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, __nv_bfloat16)();
+#if defined(RCCL_BFLOAT16)
+extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, rccl_bfloat16)();
 #endif
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, float)();
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, double)();
@@ -122,6 +136,8 @@ extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, double)();
 #define REDUCE_SLICESTEPS 1
 #define REDUCE_CHUNKSTEPS 1
 #define NCCL_MAX_SLICE_PER_CHUNK 2  // max value for CHUNKSTEPS/SLICESTEPS, must accord with above
+#define ALLTOALL_PIVOT_SLICESTEPS 2
+#define ALLTOALL_PIVOT_CHUNKSTEPS 4
 
 // We can't use the enum identifiers like ncclSum, ncclFloat, etc since this
 // macro will be used in preprocessor conditionals where enums have no meaning.

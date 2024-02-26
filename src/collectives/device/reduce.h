@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -10,7 +11,11 @@
 
 namespace {
   template<typename T, typename RedOp, typename Proto>
-  __device__ __forceinline__ void runRing(ncclWorkElem *args) {
+#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx940__) && !defined(__gfx941__) && !defined(__gfx942__)
+  __device__ void runRing(ncclWorkElem *args) {
+#else
+  __device__ __attribute__((noinline)) void runRing(ncclWorkElem *args) {
+#endif
     const int tid = threadIdx.x;
     const int nthreads = args->nWarps*WARP_SIZE;
     const int bid = args->bid;
@@ -26,13 +31,13 @@ namespace {
     const int root = args->root;
 
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0>
-      prims(tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg);
+      prims(tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg, 0, args->connIndex, args->connIndex);
 
     auto calcChunkSize = [&]__device__(ssize_t gridOffset)->int {
       int realChunkSize;
       if (Proto::Id == NCCL_PROTO_SIMPLE) {
         realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels));
-        realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
+        realChunkSize = roundUp(realChunkSize, nthreads*sizeof(uint64_t)/sizeof(T));
       }
       else if (Proto::Id == NCCL_PROTO_LL)
         realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;

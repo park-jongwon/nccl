@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -18,12 +19,23 @@ struct ncclTransport* ncclTransports[NTRANSPORTS] = {
 };
 
 template <int type>
-static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclConnect* connect, int channelId, int peer, int connIndex, int* transportType) {
+static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclConnect* connect, int channelId, int peer, int connIndex, int* transportType, bool* needsProxy) {
   struct ncclPeerInfo* myInfo = comm->peerInfo+comm->rank;
   struct ncclPeerInfo* peerInfo = comm->peerInfo+peer;
   struct ncclConnector* connector = (type == 1) ? comm->channels[channelId].peers[peer]->send + connIndex :
                                                   comm->channels[channelId].peers[peer]->recv + connIndex;
+  // handle intra-node network connections
+  int n1 = -1, n2 = -1;
+  if (connIndex == NCCL_CONN_IDX_P2P_NET) {
+    NCCLCHECK(ncclTopoGetIntraNetDev(comm->topo, comm->rank, graph, channelId, (type == 1) ? 1 : 0, &n1));
+    NCCLCHECK(ncclTopoGetIntraNetDev(comm->topo, peer, graph, channelId, (type == 1) ? 0 : 1, &n2));
+  }
+  bool xgmi;
+  NCCLCHECK(ncclTopoGetLinkType(comm->topo, myInfo->cudaDev, peerInfo->cudaDev, &xgmi));
+
   for (int t=0; t<NTRANSPORTS; t++) {
+    if (graph == NULL && connIndex == NCCL_CONN_IDX_P2P_NET && (t == TRANSPORT_SHM || (!xgmi && t == TRANSPORT_P2P))) continue;
+    if (graph && n1 >= 0 && n2 >= 0 && t != TRANSPORT_NET) continue;
     struct ncclTransport *transport = ncclTransports[t];
     struct ncclTransportComm* transportComm = type == 1 ? &transport->send : &transport->recv;
     int ret = 0;
@@ -32,6 +44,7 @@ static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph*
       connector->transportComm = transportComm;
       NCCLCHECK(transportComm->setup(comm, graph, myInfo, peerInfo, connect, connector, channelId, connIndex));
       if (transportType) *transportType = t;
+      if (needsProxy) *needsProxy = (transportComm->proxyProgress != NULL);
       return ncclSuccess;
     }
   }
@@ -46,12 +59,12 @@ ncclResult_t ncclTransportP2pConnect(struct ncclComm* comm, int channelId, int n
   for (int i=0; i<nrecv; i++) {
     int peer = peerRecv[i];
     if (peer == -1 || peer >= comm->nRanks || peer == comm->rank || channel->peers[peer]->recv[connIndex].connected) continue;
-    comm->connectRecv[peer] |= mask;
+    comm->connectRecv[peer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)] |= mask;
   }
   for (int i=0; i<nsend; i++) {
     int peer = peerSend[i];
     if (peer == -1 || peer >= comm->nRanks || peer == comm->rank || channel->peers[peer]->send[connIndex].connected) continue;
-    comm->connectSend[peer] |= mask;
+    comm->connectSend[peer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)] |= mask;
   }
   return ncclSuccess;
 }
@@ -65,10 +78,11 @@ void dumpData(struct ncclConnect* data, int ndata) {
   }
 }
 
-ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex, int* highestTransportType/*=NULL*/) {
+ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex, int* highestTransportType/*=NULL*/, bool* needsProxy/*=NULL*/) {
   // Stream used during transport setup; need for P2P pre-connect + CUDA Graph
   ncclResult_t ret = ncclSuccess;
   int highestType = TRANSPORT_P2P;  // track highest transport type
+  bool needsProxyResult = false;
   struct ncclConnect** data = (ncclConnect**) malloc(sizeof(ncclConnect*) * comm->nRanks); // Store intermediate send/recvData structs for connect
   struct ncclConnect** recvData = (ncclConnect**) malloc(sizeof(ncclConnect*) * comm->nRanks); // Points to entries inside data for given recv connection within a channel
   struct ncclConnect** sendData = (ncclConnect**) malloc(sizeof(ncclConnect*) * comm->nRanks); // Points to entries inside data for given send connection within a channel
@@ -79,8 +93,8 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     int bootstrapTag = (i<<8) + (graph ? graph->id+1 : 0);
     int recvPeer = (comm->rank - i + comm->nRanks) % comm->nRanks;
     int sendPeer = (comm->rank + i) % comm->nRanks;
-    uint64_t recvMask = comm->connectRecv[recvPeer];
-    uint64_t sendMask = comm->connectSend[sendPeer];
+    uint64_t recvMask = comm->connectRecv[recvPeer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)];
+    uint64_t sendMask = comm->connectSend[sendPeer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)];
 
     // Data[i] contains all ncclConnect information for all send and receive connections with a given send and recv peer
     // This data is packed in the array based on the number of sendChannels and recvChannels connected with these peers
@@ -91,10 +105,11 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     recvData[i] = data[i];
     int sendChannels = 0, recvChannels = 0;
     int type;
+    bool proxy;
     TIME_START(0);
     for (int c=0; c<MAXCHANNELS; c++) {
       if (recvMask & (1UL<<c)) {
-        NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[i]+recvChannels++, c, recvPeer, connIndex, &type), ret, fail);
+        NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[i]+recvChannels++, c, recvPeer, connIndex, &type, &proxy), ret, fail);
         if (type > highestType) highestType = type;
       }
     }
@@ -103,8 +118,9 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     sendData[i] = recvData[i]+recvChannels;
     for (int c=0; c<MAXCHANNELS; c++) {
       if (sendMask & (1UL<<c)) {
-        NCCLCHECKGOTO(selectTransport<1>(comm, graph, sendData[i]+sendChannels++, c, sendPeer, connIndex, &type), ret, fail);
+        NCCLCHECKGOTO(selectTransport<1>(comm, graph, sendData[i]+sendChannels++, c, sendPeer, connIndex, &type, &proxy), ret, fail);
         if (type > highestType) highestType = type;
+        needsProxyResult |= proxy;
       }
     }
     TIME_STOP(1);
@@ -134,8 +150,8 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     for (int i=1; i<comm->nRanks; i++) {
       int recvPeer = (comm->rank - i + comm->nRanks) % comm->nRanks;
       int sendPeer = (comm->rank + i) % comm->nRanks;
-      uint64_t recvMask = comm->connectRecv[recvPeer];
-      uint64_t sendMask = comm->connectSend[sendPeer];
+      uint64_t recvMask = comm->connectRecv[recvPeer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)];
+      uint64_t sendMask = comm->connectSend[sendPeer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)];
 
       int sendDataOffset = 0;
       int recvDataOffset = 0;
@@ -186,7 +202,7 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
   for (int i=1; i<comm->nRanks; i++) {
     int recvPeer = (comm->rank - i + comm->nRanks) % comm->nRanks;
     int sendPeer = (comm->rank + i) % comm->nRanks;
-    comm->connectRecv[recvPeer] = comm->connectSend[sendPeer] = 0UL;
+    comm->connectRecv[recvPeer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)] = comm->connectSend[sendPeer+comm->nRanks*(connIndex == NCCL_CONN_IDX_P2P_NET ? NCCL_CONN_IDX_P2P_NET : 0)] = 0UL;
     free(data[i]);
   }
 
@@ -195,6 +211,7 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
   free(recvData);
 
   if (highestTransportType != NULL) *highestTransportType = highestType;
+  if (needsProxy != NULL) *needsProxy = needsProxyResult;
   TIME_PRINT("P2P Setup/Connect");
 exit:
   NCCLCHECK(ncclStrongStreamWaitStream(ncclCudaGraphNone(), &comm->sharedRes->deviceStream, &comm->sharedRes->hostStream));

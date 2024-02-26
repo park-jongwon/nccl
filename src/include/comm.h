@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -13,6 +14,9 @@
 #include "proxy.h"
 #include "strongstream.h"
 
+#if defined(__HIP_PLATFORM_HCC__) || defined(__HCC__) || defined(__HIPCC__)
+#define HIPRT_CB
+#else
 #if CUDART_VERSION < 9000
 struct cudaLaunchParams {
   void *func;
@@ -23,8 +27,9 @@ struct cudaLaunchParams {
   cudaStream_t stream;
 };
 #endif
+#endif
 
-#define CACHE_LINE_SIZE 128
+#define CACHE_LINE_SIZE 64
 #define MEM_ALIGN 4096
 #define CUDA_IPC_MIN 2097152UL
 
@@ -130,7 +135,7 @@ struct ncclChannel {
 
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
-
+  struct ncclTree binTree;
   struct ncclNvls nvls;
 
   int id; // index of this channel
@@ -215,11 +220,12 @@ struct ncclComm {
   int rank;    // my rank in the communicator
   int nRanks;  // number of GPUs in communicator
   int cudaDev; // my cuda device index
-  int nvmlDev; // my nvml device index
+  //int nvmlDev; // my nvml device index
   int compCap; // compute capability of the GPU
   int minCompCap, maxCompCap; // min/max compute capability in the communicator
   int64_t busId;   // my PCI bus ID in int format
   cpu_set_t cpuAffinity; // CPU affinity of the GPU
+  int WarpSize;
   int cudaArch; // matches __CUDA_ARCH__ of device
 
   int node;
@@ -269,6 +275,11 @@ struct ncclComm {
   volatile uint32_t *abortFlag;
   volatile uint32_t *childAbortFlag;
   uint32_t *abortFlagRefCount;
+
+  // Flags for enable P2P NET
+  uint32_t p2pNet;
+  uint32_t useIntraNet;
+  bool hasFineGrain;
 
   // Device side of the communicator (for cudaFree's)
   struct ncclDevComm* devComm; // actually = &ncclDevCommAndChannels::comm
@@ -325,6 +336,8 @@ struct ncclComm {
   int persistentRefs; // number of persistent plan-lists capturing this comm
   struct ncclTasks tasks;
 
+  hipStream_t sideStream; // [RCCL] Cached non-captured stream
+
   // user-created reduction ops
   int userRedOpCapacity, userRedOpFreeHead;
   ncclUserRedOp *userRedOps;
@@ -337,6 +350,16 @@ struct ncclComm {
   // First of the unlaunched kernels in `planQueue`
   struct ncclKernelPlan* unlaunchedPlansHead;
 
+  hipEvent_t doneEvent;
+  hipStream_t lastStream;
+
+#ifdef ENABLE_COLLTRACE
+  struct ncclCollTrace* collTrace;
+  union ncclCollTraceTail *collTraceTail;
+  pthread_t collTraceThread;
+  volatile bool collTraceExit;
+#endif
+
   ncclConfig_t config;
   // initState is to more conveniently reclaim resources when errors happen.
   ncclResult_t initState;
@@ -344,6 +367,9 @@ struct ncclComm {
   bool finalizeCalled;
   // shared structures for finalization
   int finalizeRankCnt;
+
+  // Whether this comm is compatible with MSCCL
+  bool mscclCompatible;
 };
 
 enum ncclLaunchMode {

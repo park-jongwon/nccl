@@ -1,5 +1,7 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
+ * Modifications Copyright (c) Microsoft Corporation. Licensed under the MIT License.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -15,8 +17,6 @@
 
 #include <sys/syscall.h>
 #include <assert.h>
-
-enum { proxyRecv=0, proxySend=1 };
 
 static bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, int nranks) {
   if (pattern == ncclPatternRing || pattern == ncclPatternRingTwice) return true;
@@ -518,6 +518,11 @@ static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel
   return ncclSuccess;
 }
 
+ncclResult_t mscclSaveProxy(struct ncclComm* comm, struct ncclChannel* channel, int type, int peer, struct ncclProxyOp* op, int connIndex) {
+  NCCLCHECK(SaveProxy(comm, channel, type, peer, op, connIndex, nullptr));
+  return ncclSuccess;
+}
+
 // justInquire != nullptr means don't actually do anything, just assertain need of
 // ncclProxySaveOp for this op.
 ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool* justInquire) {
@@ -530,10 +535,10 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   case ncclPatternPipelineTo: {
       struct ncclRing* ring = &channel->ring;
       if (NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks)) {
-        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, 0, justInquire));
+        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, op->connIndex, justInquire));
       }
       if (NeedProxy(proxySend, op->pattern, op->root, ring, comm->nRanks)) {
-        NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, 0, justInquire));
+        NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, op->connIndex, justInquire));
       }
     } break;
   case ncclPatternTreeUp:
@@ -577,7 +582,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   case ncclPatternSend:
   case ncclPatternRecv: {
       if (op->root == comm->rank) return ncclSuccess;
-      NCCLCHECK(SaveProxy(comm, channel, op->pattern == ncclPatternSend ? proxySend : proxyRecv, op->root, op, 1, justInquire));
+      NCCLCHECK(SaveProxy(comm, channel, op->pattern == ncclPatternSend ? proxySend : proxyRecv, op->root, op, op->connIndex, justInquire));
     } break;
   }
   return ncclSuccess;

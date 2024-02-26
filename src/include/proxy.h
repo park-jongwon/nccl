@@ -1,5 +1,7 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
+ * Modifications Copyright (c) Microsoft Corporation. Licensed under the MIT License.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -16,6 +18,7 @@
 #include "p2p.h"
 
 enum ncclProxyOpState { ncclProxyOpNone, ncclProxyOpReady, ncclProxyOpProgress };
+enum { proxyRecv=0, proxySend=1 };
 
 struct ncclProxyArgs;
 typedef ncclResult_t (*proxyProgressFunc_t)(struct ncclProxyState*, struct ncclProxyArgs*);
@@ -28,7 +31,10 @@ struct ncclProxyOp {
   int channelId;
   int nsteps;
   ssize_t nbytes;
-  int root;
+  struct {
+    int root:30;
+    uint32_t connIndex:2;
+  };
   int next;
 
   uint64_t opCount;
@@ -65,6 +71,11 @@ struct ncclProxySubArgs {
   uint64_t end;
   void* requests[NCCL_STEPS];
   void* profilingEvents[NCCL_STEPS];
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_NET_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_NET_SEND_EXIT)
+  int npKitSizesFifo[NCCL_STEPS];
+  uint64_t timestamp[NCCL_STEPS];
+#endif
 };
 
 struct ncclProxyArgs {
@@ -85,6 +96,7 @@ struct ncclProxyArgs {
   int sharedSize[NCCL_STEPS];
 
   int idle;
+  uint64_t hdp_flushed;
 
   // Element linking
   struct ncclProxyArgs* next;
@@ -277,4 +289,7 @@ ncclResult_t ncclProxyClientConvertFdBlocking(struct ncclComm* comm, struct nccl
 ncclResult_t ncclProxyStop(struct ncclComm* comm);
 ncclResult_t ncclProxyShmUnlink(struct ncclComm* comm);
 ncclResult_t ncclProxyDestroy(struct ncclComm* comm);
+
+ncclResult_t mscclSaveProxy(struct ncclComm* comm, struct ncclChannel* channel, int type, int peer, struct ncclProxyOp* op, int connIndex);
+
 #endif

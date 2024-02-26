@@ -5,7 +5,7 @@
  ************************************************************************/
 
 #include "strongstream.h"
-#include "cudawrap.h"
+#include "rocmwrap.h"
 #include "checks.h"
 #include "param.h"
 

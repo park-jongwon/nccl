@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -13,15 +14,16 @@
 #include <cstdio>
 #include <cstdint>
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+
+#define __syncwarp()
 
 // Define min for ssize_t
 inline __device__ int min(int a, ssize_t b) { return (a < b) ? a : b; }
 
 inline __device__ int loadInt(int* ptr) {
   int v;
-  asm volatile("ld.volatile.global.u32 %0, [%1];"
-      : "=r"(v) : "l"(ptr));
+  v = atomicAdd((unsigned long long *)ptr, 0);
   return v;
 }
 
@@ -36,7 +38,7 @@ __device__ __forceinline__ void reduceCopyPacks(
     IntBytes &nBytesBehind, IntBytes &nBytesAhead
   ) {
   static_assert(std::is_signed<IntBytes>::value, "IntBytes must be a signed integral type.");
-  if (BytePerPack == 0) __trap();
+  //if (BytePerPack == 0) __trap();
 
   // A hunk is the amount of contiguous data a warp consumes per loop iteration
   // assuming all threads partake.
@@ -91,7 +93,7 @@ __device__ __forceinline__ void reduceCopyPacks(
       }
     }
 
-    #pragma unroll (MinSrcs-1 + !(MinSrcs-1))
+    #pragma unroll Unroll
     for (int s=1; s < MinSrcs; s++) {
       BytePack<BytePerPack> tmp[Unroll];
       RedFn preFn(s < PreOpSrcs ? preOpArgs[s] : 0);
@@ -136,7 +138,7 @@ __device__ __forceinline__ void reduceCopyPacks(
         acc[u] = applyPostOp(redFn, acc[u]);
     }
 
-    #pragma unroll (MinDsts + !MinDsts)
+    #pragma unroll Unroll
     for (int d=0; d < MinDsts; d++) {
       #pragma unroll Unroll
       for (int u=0; u < Unroll; u++) {
@@ -210,12 +212,19 @@ __device__ __forceinline__ void reduceCopy(
     bool aligned = true;
     if (lane < nSrcs) aligned &= 0 == cvta_to_global(srcPtrs[lane]) % (BigPackSize + !BigPackSize);
     if (lane < nDsts) aligned &= 0 == cvta_to_global(dstPtrs[lane]) % (BigPackSize + !BigPackSize);
-    aligned = __all_sync(~0u, aligned);
+    aligned = !(__any(!aligned));
     if (aligned) {
-      reduceCopyPacks<RedFn, T, Unroll, BigPackSize,
+#if defined(__gfx90a__)
+      reduceCopyPacks<RedFn, T, ((MinSrcs > 1) ? 2 : Unroll), BigPackSize,
+        MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+        (nThreads, thread, redArg, preOpArgs, postOp,
+         nSrcs, srcPtrs, nDsts, dstPtrs, nBytesBehind, nBytesAhead);
+#else
+      reduceCopyPacks<RedFn, T, Unroll*((MinSrcs == 1 && MinDsts == 1) ? 2 : 1), BigPackSize,
         MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
         (nThreads, /*&*/thread, redArg, preOpArgs, postOp,
          nSrcs, srcPtrs, nDsts, dstPtrs, /*&*/nBytesBehind, /*&*/nBytesAhead);
+#endif
       if (nBytesAhead == 0) return;
 
       reduceCopyPacks<RedFn, T, /*Unroll=*/1, BigPackSize,
@@ -226,10 +235,24 @@ __device__ __forceinline__ void reduceCopy(
     }
   }
 
+#if defined(__gfx90a__)
+  if (MinSrcs > 1) {
+    reduceCopyPacks<RedFn, T, Unroll/2*(16/sizeof(T))/2, sizeof(T),
+    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+    (nThreads, thread, redArg, preOpArgs, postOp,
+     nSrcs, srcPtrs, nDsts, dstPtrs, nBytesBehind, nBytesAhead);
+  } else {
+    reduceCopyPacks<RedFn, T, Unroll*(16/sizeof(T))/2, /*BytePerPack=*/sizeof(T),
+    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+    (nThreads, /*&*/thread, redArg, preOpArgs, postOp,
+     nSrcs, srcPtrs, nDsts, dstPtrs, /*&*/nBytesBehind, /*&*/nBytesAhead);
+  }
+#else
   reduceCopyPacks<RedFn, T, Unroll*(16/sizeof(T))/2, /*BytePerPack=*/sizeof(T),
     MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
     (nThreads, /*&*/thread, redArg, preOpArgs, postOp,
      nSrcs, srcPtrs, nDsts, dstPtrs, /*&*/nBytesBehind, /*&*/nBytesAhead);
+#endif
   if (nBytesAhead == 0) return;
 
   reduceCopyPacks<RedFn, T, /*Unroll=*/1, /*BytePerPack=*/sizeof(T),

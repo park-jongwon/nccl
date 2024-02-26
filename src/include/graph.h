@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -34,6 +35,9 @@ int ncclTopoPathAllNVLink(struct ncclTopoSystem* system);
 ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoGraph* graph, int channelId, int peerRank, int* net, int* proxyRank);
 ncclResult_t ncclTopoCheckP2p(struct ncclTopoSystem* system, int64_t id1, int64_t id2, int* p2p, int *read, int* intermediateRank);
 ncclResult_t ncclTopoCheckGdr(struct ncclTopoSystem* topo, int64_t busId, int netDev, int read, int* useGdr);
+#define MAX_XGMI_INTER_GPUS 4
+ncclResult_t ncclTopoGetIntraNetDev(struct ncclTopoSystem* system, int rank, struct ncclTopoGraph* graph, int channelId, int type, int* dev);
+ncclResult_t ncclTopoGetLinkType(struct ncclTopoSystem* system, int cudaDev1, int cudaDev2, bool* isXGMI, int maxInter=MAX_XGMI_INTER_GPUS, int nInter=0, int *inter=nullptr);
 ncclResult_t ncclTopoNeedFlush(struct ncclTopoSystem* system, int64_t busId, int* flush);
 ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int64_t id1, int64_t id2, int* net);
 int ncclPxnDisable(struct ncclComm* comm);
@@ -51,6 +55,8 @@ ncclResult_t ncclTopoGetCpuAffinity(struct ncclTopoSystem* system, int rank, cpu
 #define NCCL_TOPO_CPU_VENDOR_ZHAOXIN 3
 #define NCCL_TOPO_CPU_TYPE_BDW 1
 #define NCCL_TOPO_CPU_TYPE_SKL 2
+#define NCCL_TOPO_CPU_TYPE_ZEN 3
+#define NCCL_TOPO_CPU_TYPE_ROME 4
 #define NCCL_TOPO_CPU_TYPE_YONGFENG 1
 ncclResult_t ncclTopoCpuType(struct ncclTopoSystem* system, int* arch, int* vendor, int* model);
 ncclResult_t ncclTopoGetGpuCount(struct ncclTopoSystem* system, int* count);
@@ -88,6 +94,9 @@ struct ncclTopoGraph {
   int nHops;
   int intra[MAXCHANNELS*NCCL_TOPO_MAX_NODES];
   int inter[MAXCHANNELS*2];
+  int nIntraChannels;
+  int intraNets[MAXCHANNELS*NCCL_TOPO_MAX_NODES*2];
+  char treeBase[NCCL_TOPO_MAX_NODES][NCCL_TOPO_MAX_NODES*4];
 };
 ncclResult_t ncclTopoCompute(struct ncclTopoSystem* system, struct ncclTopoGraph* graph);
 
@@ -108,7 +117,8 @@ struct ncclTopoRanks {
 ncclResult_t ncclTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs, struct ncclTopoRanks* topoRanks);
 
 ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePatterns,
-    struct ncclTopoRanks** allTopoRanks, int* rings, struct ncclTopoGraph** graphs);
+    struct ncclTopoRanks** allTopoRanks, int* rings, struct ncclTopoGraph** graphs, int nc);
+ncclResult_t ncclTreeBasePostset(struct ncclComm* comm, struct ncclTopoGraph* treeGraph);
 
 ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCompCap, struct ncclTopoGraph** graphs);
 #include "info.h"

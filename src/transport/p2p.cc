@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -8,6 +9,8 @@
 #include "graph.h"
 #include "utils.h"
 #include "shm.h"
+#include "graph.h"
+#include "graph/topo.h"
 #include "p2p.h"
 
 enum p2pType { P2P_DIRECT, P2P_INTERMEDIATE, P2P_IPC, P2P_CUMEM };
@@ -68,6 +71,7 @@ struct p2pResources {
   struct p2pShm* devShm;
   int shmSize;
   ncclShmHandle_t handle;
+  uint32_t* next_hdp_reg;  // Next GPU in ring (for p2p transport use only)
 };
 
 // cuMem API support
@@ -102,6 +106,12 @@ static void initCeOperation();
 /* Determine if two peers can communicate through p2p */
 ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTopoGraph* graph, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2) {
   initCeOperation();
+#if defined(__HIP_PLATFORM_HCC__) || defined(__HCC__) || defined(__HIPCC__)
+  if (!info1->hasFineGrain || !info2->hasFineGrain)  {
+    *ret = 0;
+    return ncclSuccess;
+  }
+#endif
 
   // Rule out different nodes / isolated containers
   if (info1->hostHash != info2->hostHash || info1->shmDev != info2->shmDev) {
@@ -130,7 +140,7 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTop
   int cudaDev1 = busIdToCudaDev(info1->busId);
   int cudaDev2 = busIdToCudaDev(info2->busId);
   if (cudaDev1 == -1 || cudaDev2 == -1) {
-#if CUDART_VERSION >= 10010
+#if defined(__HIP_PLATFORM_HCC__) || defined(__HCC__) || defined(__HIPCC__) || CUDART_VERSION >= 10010
     // CUDA 10.1 and later can use P2P with invisible devices.
     return ncclSuccess;
 #else
@@ -149,6 +159,8 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTop
     return ncclSuccess;
   }
 
+#if defined(__HIP_PLATFORM_HCC__) || defined(__HCC__) || defined(__HIPCC__)
+#else
   // This will always fail when using NCCL_CUMEM_ENABLE=1
   if (p2p != 0 && !ncclCuMemEnable()) {
     // Cached result of the legacyIPC detection
@@ -169,6 +181,7 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTop
     legacyIPC = *ret;
     return ncclSuccess;
   }
+#endif
 
   if (p2p == 0) {
     INFO(NCCL_INIT|NCCL_P2P,"Could not enable P2P between dev %d(=%lx) and dev %d(=%lx)",
@@ -201,7 +214,7 @@ ncclResult_t ncclP2pAllocateShareableBuffer(size_t size, ncclIpcDesc *ipcDesc, v
 #endif
   } else {
     // Allocate a CUDA buffer and generate an IPC handle for it
-    NCCLCHECK(ncclCudaCalloc((char **)ptr, size));
+    NCCLCHECK(ncclCudaCalloc((char **)ptr, size, nullptr, true));
     cudaError_t res = cudaIpcGetMemHandle(&ipcDesc->devIpc, *ptr);
     if (res != cudaSuccess) {
       WARN("cudaIpcGetMemHandle failed : %s", cudaGetErrorString(res));
@@ -335,6 +348,17 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   NCCLCHECK(p2pGetInfo(comm->topo, myInfo, peerInfo, &useRead, &intermediateRank));
   if (useMemcpy) useRead = 0;
 
+  resources->next_hdp_reg = 0;
+  bool isXGMI;
+  if (ncclTopoGetLinkType(comm->topo, myInfo->cudaDev, peerInfo->cudaDev, &isXGMI) != ncclSuccess) {
+    INFO(NCCL_INIT|NCCL_P2P,"Ring %02d : %d -> %d failed to get link type and hop count", channelId, myInfo->rank, peerInfo->rank);
+    return ncclInternalError;
+  }
+  if (!isXGMI && !IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx90a") && !IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx94")) {
+    CUDACHECK(hipDeviceGetAttribute((int*)&resources->next_hdp_reg, hipDeviceAttributeHdpMemFlushCntl,peerInfo->cudaDev));
+    TRACE(NCCL_INIT|NCCL_P2P,"Ring %02d : %d -> %d HDP %p", channelId, myInfo->rank, peerInfo->rank, resources->next_hdp_reg);
+  }
+
   static_assert(sizeof(struct p2pConnectInfo) <= sizeof(struct ncclConnect), "p2p Connect Info is too big");
   struct p2pConnectInfo* info = (struct p2pConnectInfo*)connectInfo;
   info->read = useRead;
@@ -352,28 +376,28 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
     if (myInfo->pidHash == peerInfo->pidHash && ncclParamP2pDirectDisable() == 0 && useMemcpy == 0 && !ncclCuMemEnable()) {
       resources->type = P2P_DIRECT;
       send->conn.flags |= info->read ? NCCL_DIRECT_READ : NCCL_DIRECT_WRITE;
-      INFO(NCCL_INIT|NCCL_P2P, "Channel %02d/%01d : %d[%d] -> %d[%d] via P2P/direct pointer%s",
-          channelId, connIndex, myInfo->rank, myInfo->nvmlDev, peerInfo->rank, peerInfo->nvmlDev, useReadStr);
+      INFO(NCCL_INIT|NCCL_P2P, "Channel %02d/%01d : %d[%lx] -> %d[%lx] via P2P/direct pointer%s comm %p nRanks %02d",
+          channelId, connIndex, myInfo->rank, myInfo->busId, peerInfo->rank, peerInfo->busId, useReadStr, comm, comm->nRanks);
     } else {
       // cuMem API support
       if (ncclCuMemEnable()) {
         resources->type = P2P_CUMEM;
-        INFO(NCCL_INIT|NCCL_P2P,"Channel %02d/%01d : %d[%d] -> %d[%d] via P2P/CUMEM%s%s",
-             channelId, connIndex, myInfo->rank, myInfo->nvmlDev, peerInfo->rank, peerInfo->nvmlDev, useReadStr, useMemcpy ? "/CE" : "");;
+        INFO(NCCL_INIT|NCCL_P2P,"Channel %02d/%01d : %d[%x] -> %d[%x] via P2P/CUMEM%s%s comm %p nRanks %02d",
+             channelId, connIndex, myInfo->rank, myInfo->cudaDev, peerInfo->rank, peerInfo->cudaDev, useReadStr, useMemcpy ? "/CE" : "", comm, comm->nRanks);;
       } else {
         // Legacy CUDA IPC
         resources->type = P2P_IPC;
-        INFO(NCCL_INIT|NCCL_P2P,"Channel %02d/%01d : %d[%d] -> %d[%d] via P2P/IPC%s%s",
-             channelId, connIndex, myInfo->rank, myInfo->nvmlDev, peerInfo->rank, peerInfo->nvmlDev, useReadStr, useMemcpy ? "/CE" : "");
+        INFO(NCCL_INIT|NCCL_P2P,"Channel %02d/%01d : %d[%lx] -> %d[%lx] via P2P/IPC%s%s comm %p nRanks %02d",
+             channelId, connIndex, myInfo->rank, myInfo->busId, peerInfo->rank, peerInfo->busId, useReadStr, useMemcpy ? "/CE" : "", comm, comm->nRanks);
       }
       send->conn.flags |= info->read ? NCCL_IPC_READ : NCCL_IPC_WRITE;
     }
   } else {
     resources->type = P2P_INTERMEDIATE;
     info->rank = intermediateRank;
-    INFO(NCCL_INIT|NCCL_P2P, "Channel %02d/%01d : %d[%d] -> %d[%d] via P2P/indirect/%d[%d]%s",
-        channelId, connIndex, myInfo->rank, myInfo->nvmlDev, peerInfo->rank, peerInfo->nvmlDev, intermediateRank,
-	  comm->peerInfo[intermediateRank].nvmlDev, useReadStr);
+    INFO(NCCL_INIT|NCCL_P2P, "Channel %02d/%01d : %d[%lx] -> %d[%lx] via P2P/indirect/%d[%lx]%s comm %p nRanks %02d",
+        channelId, connIndex, myInfo->rank, myInfo->busId, peerInfo->rank, peerInfo->busId, intermediateRank,
+	  comm->peerInfo[intermediateRank].busId, useReadStr, comm, comm->nRanks);
   }
 
   tpProxyRank = comm->topParentRanks[info->rank];
@@ -421,7 +445,7 @@ ncclResult_t p2pRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
         // cuMem API support
         resources->type = P2P_CUMEM;
         TRACE(NCCL_INIT|NCCL_P2P,"Ring %02d : %d[%d] <- %d[%d] via P2P/CUMEM",
-              channelId, myInfo->rank, myInfo->nvmlDev, peerInfo->rank, peerInfo->nvmlDev);
+              channelId, myInfo->rank, myInfo->cudaDev, peerInfo->rank, peerInfo->cudaDev);
       } else {
         // Legacy CUDA IPC
         resources->type = P2P_IPC;
@@ -562,7 +586,7 @@ static ncclResult_t p2pSendProxySetup(struct ncclProxyConnection* connection, st
     NCCLCHECK(ncclCalloc(&proxyInfo, 1));
     connection->transportResources = proxyInfo;
 
-    NCCLCHECK(ncclCudaCalloc(&proxyInfo->ceDevBuff, proxyState->buffSizes[NCCL_PROTO_SIMPLE]));
+    NCCLCHECK(ncclCudaCalloc(&proxyInfo->ceDevBuff, proxyState->buffSizes[NCCL_PROTO_SIMPLE], nullptr, true));
 
     char shmPath[PATH_MAX];
     shmPath[0] = '\0';

@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -24,6 +25,7 @@
 #include "timer.h"
 
 #include "ibvwrap.h"
+#include "graph/xml.h"
 
 #define MAXNAMESIZE 64
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -66,7 +68,7 @@ struct userIbDev {
   uint16_t port_en;
 };
 
-#define MAX_IB_DEVS 32
+#define MAX_IB_DEVS 16
 struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];
 struct userIbDev userIbDevs[MAX_IB_DEVS];
 pthread_mutex_t ncclIbLock = PTHREAD_MUTEX_INITIALIZER;
@@ -82,6 +84,11 @@ NCCL_PARAM(IbTc, "IB_TC", 0);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
+
+NCCL_PARAM(IbSockClientPortReuse, "IB_SOCK_CLIENT_PORT_REUSE", 0);
+NCCL_PARAM(IbSockServerPortReuse, "IB_SOCK_SERVER_PORT_REUSE", 0);
+static thread_local union ncclSocketAddress reusedAddr;
+static thread_local int reusedSockfd = -1;
 
 pthread_t ncclIbAsyncThread;
 static void* ncclIbAsyncThreadMain(void* args) {
@@ -243,6 +250,9 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
           pthread_detach(ncclIbAsyncThread); // will not be pthread_join()'d
           ncclNIbDevs++;
           nPorts++;
+          // [RCCL]
+          pthread_detach(ncclIbAsyncThread);
+          // [/RCCL]
         }
         if (nPorts == 0 && ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
       }
@@ -281,10 +291,22 @@ ncclResult_t ncclIbDevices(int* ndev) {
 ncclResult_t ncclIbGdrSupport(int ibDev) {
   static int moduleLoaded = -1;
   if (moduleLoaded == -1) {
+#if defined(__HIP_PLATFORM_HCC__) || defined(__HCC__) || defined(__HIPCC__)
+    moduleLoaded = (access("/sys/kernel/mm/memory_peers/amdkfd/version", F_OK) == -1) ? 0 : 1;
+    char strValue[MAX_STR_LEN];
+    NCCLCHECK(ncclTopoGetStrFromSys("/sys/devices/virtual/dmi/id", "bios_version", strValue));
+    if (strncmp("Hyper-V UEFI Release", strValue, 20) == 0) {
+      int roMode = ncclParamIbPciRelaxedOrdering();
+      NCCLCHECK(ncclTopoGetStrFromSys("/proc/sys/kernel", "numa_balancing", strValue));
+      if (strcmp(strValue, "1") == 0 && roMode == 0)
+        moduleLoaded = 0;
+    }
+#else
     // Check for the nv_peer_mem module being loaded
     moduleLoaded = ((access("/sys/kernel/mm/memory_peers/nv_mem/version", F_OK) == -1) &&
                     // Also support the new nvidia-peermem module
                     (access("/sys/kernel/mm/memory_peers/nvidia-peermem/version", F_OK) == -1)) ? 0 : 1;
+#endif
   }
   if (moduleLoaded == 0) return ncclSystemError;
   return ncclSuccess;
@@ -298,6 +320,7 @@ ncclResult_t ncclIbDmaBufSupport(int dev) {
   static int dmaBufSupported = -1;
   if (dmaBufSupported == -1) {
     ncclResult_t res;
+    NCCLCHECKGOTO(rocmLibraryInit(), res, failure);
     struct ibv_pd* pd;
     struct ibv_context* ctx;
     ctx = ncclIbDevs[dev].context;
@@ -429,7 +452,7 @@ struct ncclIbListenComm {
   struct ncclIbCommStage stage;
 };
 
-struct ncclIbSendFifo {
+struct alignas(64) ncclIbSendFifo {
   uint64_t addr;
   int      size;
   uint32_t rkey;
@@ -602,7 +625,19 @@ ncclResult_t ncclIbListen(int dev, void* opaqueHandle, void** listenComm) {
   comm->dev = dev;
   handle->magic = NCCL_SOCKET_MAGIC;
   NCCLCHECK(ncclSocketInit(&comm->sock, &ncclIbIfAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1));
-  NCCLCHECK(ncclSocketListen(&comm->sock));
+  if (ncclParamIbSockServerPortReuse()) {
+    // reuse the socket address and fd for listen system call
+    if (reusedSockfd == -1) {
+      NCCLCHECK(ncclSocketListen(&comm->sock));
+      memcpy(&reusedAddr, &comm->sock.addr, sizeof(union ncclSocketAddress));
+      reusedSockfd = comm->sock.fd;
+    } else {
+      memcpy(&comm->sock.addr, &reusedAddr, sizeof(union ncclSocketAddress));
+      comm->sock.fd = reusedSockfd;
+    }
+  } else {
+    NCCLCHECK(ncclSocketListen(&comm->sock));
+  }
   NCCLCHECK(ncclSocketGetAddr(&comm->sock, &handle->connectAddr));
   *listenComm = comm;
   return ncclSuccess;
@@ -628,7 +663,7 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm) {
   NCCLCHECK(ncclSocketInit(&comm->sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1));
   stage->comm = comm;
   stage->state = ncclIbCommStateConnect;
-  NCCLCHECK(ncclSocketConnect(&comm->sock));
+  NCCLCHECK(ncclSocketConnect(&comm->sock, ncclParamIbSockClientPortReuse()));
 
 ib_connect_check:
   /* since ncclSocketConnect is async, we must check if connection is complete */
@@ -1340,7 +1375,7 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
 ncclResult_t ncclIbCloseRecv(void* recvComm) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm) {
-    NCCLCHECK(ncclSocketClose(&comm->sock));
+    if (!ncclParamIbSockServerPortReuse() || reusedSockfd != comm->sock.fd) NCCLCHECK(ncclSocketClose(&comm->sock));
     for (int q=0; q<comm->nqps; q++)
       if (comm->qps[q] != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->qps[q]));
     if (comm->gpuFlush.enabled) {

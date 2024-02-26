@@ -1,5 +1,7 @@
 /*************************************************************************
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
+ * Modifications Copyright (c) Microsoft Corporation. Licensed under the MIT License.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -10,6 +12,8 @@
 #include "transport.h"
 #include "channel.h"
 #include <assert.h>
+
+#include "msccl/msccl_lifecycle.h"
 
 __thread int ncclGroupDepth = 0; // depth of ncclGroupStart nesting
 __thread ncclResult_t ncclGroupError = ncclSuccess;
@@ -89,6 +93,22 @@ ncclResult_t ncclGroupStart() {
   return ret;
 }
 
+inline ncclResult_t ncclGroupStartInternal() {
+  /* if previous group launch does not complete, don't launch this one. */
+  if (ncclGroupJobMainPtr != NULL) {
+    if (__atomic_load_n(&ncclGroupJobMainPtr->doneFlag, __ATOMIC_ACQUIRE) == false) {
+      return ncclInvalidUsage;
+    } else {
+      NCCLCHECK(groupJobComplete(ncclGroupJobMainPtr));
+    }
+  }
+  ncclGroupDepth++;
+  if (mscclAvailable() && !mscclIsCaller()) {
+    NCCLCHECK(mscclGroupStart());
+  }
+  return ncclSuccess;
+}
+
 NCCL_API(ncclResult_t, ncclGroupEnd);
 ncclResult_t ncclGroupEnd() {
   ncclResult_t ret = ncclSuccess;
@@ -109,6 +129,7 @@ ncclResult_t ncclPreconnectFunc(struct ncclAsyncJob* job_) {
   CUDACHECK(cudaSetDevice(comm->cudaDev));
   if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
   NCCLCHECK(ncclTransportP2pSetup(comm, NULL, 1));
+  if (comm->p2pNet) NCCLCHECK(ncclTransportP2pSetup(comm, NULL, NCCL_CONN_IDX_P2P_NET));
   return ncclSuccess;
 }
 
@@ -365,6 +386,10 @@ ncclResult_t ncclGroupEndInternal() {
     WARN("ncclGroupEnd: not in a group call.");
     ret = ncclInvalidUsage;
     goto exit;
+  }
+
+  if (mscclAvailable() && !mscclIsCaller()) {
+    NCCLCHECK(mscclGroupEnd());
   }
 
   if ((--ncclGroupDepth) > 0) goto exit;

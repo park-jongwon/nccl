@@ -53,6 +53,8 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
   ncclCommPushCudaFree(comm, channel->devRingUserRanks);
 
   NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(), &sharedRes->deviceStream));
+  CUDACHECK(hipEventRecord(sharedRes->deviceStream.scratchEvent, sharedRes->deviceStream.cudaStream));
+  CUDACHECK(hipStreamWaitEvent(sharedRes->deviceStream.cudaStream, sharedRes->deviceStream.scratchEvent, 0));
 
   return ncclSuccess;
 }

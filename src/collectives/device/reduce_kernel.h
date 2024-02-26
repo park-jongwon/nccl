@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2015-2021, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2021 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -243,7 +244,7 @@ struct Apply_Reduce<FuncSum<int8_t>, /*EltPerPack=*/4> {
   SPECIALIZE_REDUCE(FuncMax, half, 1, half, __float2half(fmaxf(__half2float(x), __half2float(y))))
 #endif
 
-#if defined(__CUDA_BF16_TYPES_EXIST__)
+#if defined(RCCL_BFLOAT16)
 #if __CUDA_ARCH__ >= 800
   SPECIALIZE_REDUCE(FuncSum, __nv_bfloat16, 1, __nv_bfloat16, __hadd(x, y))
   SPECIALIZE_REDUCE(FuncSum, __nv_bfloat16, 2, __nv_bfloat162, __hadd2(x, y))
@@ -254,10 +255,10 @@ struct Apply_Reduce<FuncSum<int8_t>, /*EltPerPack=*/4> {
   SPECIALIZE_REDUCE(FuncMax, __nv_bfloat16, 1, __nv_bfloat16, __hmax(x, y))
   SPECIALIZE_REDUCE(FuncMax, __nv_bfloat16, 2, __nv_bfloat162, __hmax2(x, y))
 #else
-  SPECIALIZE_REDUCE(FuncSum, __nv_bfloat16, 1, __nv_bfloat16, __float2bfloat16(__bfloat162float(x) + __bfloat162float(y)))
-  SPECIALIZE_REDUCE(FuncProd, __nv_bfloat16, 1, __nv_bfloat16, __float2bfloat16(__bfloat162float(x) * __bfloat162float(y)))
-  SPECIALIZE_REDUCE(FuncMin, __nv_bfloat16, 1, __nv_bfloat16, __float2bfloat16(fminf(__bfloat162float(x), __bfloat162float(y))))
-  SPECIALIZE_REDUCE(FuncMax, __nv_bfloat16, 1, __nv_bfloat16, __float2bfloat16(fmaxf(__bfloat162float(x), __bfloat162float(y))))
+  SPECIALIZE_REDUCE(FuncSum, rccl_bfloat16, 1, rccl_bfloat16, (rccl_bfloat16)((float)(x) + (float)(y)))
+  SPECIALIZE_REDUCE(FuncProd, rccl_bfloat16, 1, rccl_bfloat16, (rccl_bfloat16)((float)(x) * (float)(y)))
+  SPECIALIZE_REDUCE(FuncMin, rccl_bfloat16, 1, rccl_bfloat16, (rccl_bfloat16)(fminf((float)(x), (float)(y))))
+  SPECIALIZE_REDUCE(FuncMax, rccl_bfloat16, 1, rccl_bfloat16, (rccl_bfloat16)(fmaxf((float)(x), (float)(y))))
 #endif
 #endif
 
@@ -382,10 +383,10 @@ struct FuncPreMulSum<half> {
 #endif
 };
 
-#if defined(__CUDA_BF16_TYPES_EXIST__)
+#if defined(RCCL_BFLOAT16)
   template<>
-  struct FuncPreMulSum<__nv_bfloat16> {
-    using EltType = __nv_bfloat16;
+  struct FuncPreMulSum<rccl_bfloat16> {
+    using EltType = rccl_bfloat16;
   #if __CUDA_ARCH__ >= 800
     __nv_bfloat162 scalar;
     __device__ FuncPreMulSum(uint64_t opArg=0) {
@@ -397,9 +398,9 @@ struct FuncPreMulSum<half> {
   #else
     float scalar;
     __device__ FuncPreMulSum(uint64_t opArg=0) {
-      union { uint64_t u64; __nv_bfloat16 val; };
+      union { uint64_t u64; rccl_bfloat16 val; };
       u64 = opArg;
-      scalar = __bfloat162float(val);
+      scalar = (float)(val);
     }
   #endif
   };
@@ -449,23 +450,23 @@ struct Apply_PreOp<FuncPreMulSum<half>, /*EltPerPack=*/1> {
 ////////////////////////////////////////////////////////////////////////////////
 // Apply_PreOp of FuncPreMulSum for bfloat16.
 
-#if defined(__CUDA_BF16_TYPES_EXIST__)
+#if defined(RCCL_BFLOAT16)
   template<>
-  struct Apply_PreOp<FuncPreMulSum<__nv_bfloat16>, /*EltPerPack=*/1> {
+  struct Apply_PreOp<FuncPreMulSum<rccl_bfloat16>, /*EltPerPack=*/1> {
     static constexpr bool IsIdentity = false;
-    __device__ static BytePack<sizeof(__nv_bfloat16)> preOp(
-        FuncPreMulSum<__nv_bfloat16> fn, BytePack<sizeof(__nv_bfloat16)> a
+    __device__ static BytePack<sizeof(rccl_bfloat16)> preOp(
+        FuncPreMulSum<rccl_bfloat16> fn, BytePack<sizeof(rccl_bfloat16)> a
       ) {
       #if __CUDA_ARCH__ >= 800
         return toPack<__nv_bfloat16>(__hmul(fromPack<__nv_bfloat16>(a), fn.scalar.x));
       #else
-        return toPack<__nv_bfloat16>(__float2bfloat16(__bfloat162float(fromPack<__nv_bfloat16>(a)) * fn.scalar));
+        return toPack<rccl_bfloat16>((rccl_bfloat16)((float)(fromPack<rccl_bfloat16>(a)) * fn.scalar));
       #endif
     }
   };
   #if __CUDA_ARCH__ >= 800
     template<>
-    struct Apply_PreOp<FuncPreMulSum<__nv_bfloat16>, /*EltPerPack=*/2> {
+    struct Apply_PreOp<FuncPreMulSum<rccl_bfloat16>, /*EltPerPack=*/2> {
       static constexpr bool IsIdentity = false;
       __device__ static BytePack<sizeof(__nv_bfloat162)> preOp(
           FuncPreMulSum<__nv_bfloat16> fn, BytePack<sizeof(__nv_bfloat162)> a
@@ -483,9 +484,9 @@ template<typename T>
 struct IsFloatingPoint: std::false_type {};
 template<>
 struct IsFloatingPoint<half>: std::true_type {};
-#if defined(__CUDA_BF16_TYPES_EXIST__)
+#if defined(RCCL_BFLOAT16)
 template<>
-struct IsFloatingPoint<__nv_bfloat16>: std::true_type {};
+struct IsFloatingPoint<rccl_bfloat16>: std::true_type {};
 #endif
 template<>
 struct IsFloatingPoint<float>: std::true_type {};
@@ -586,7 +587,7 @@ struct Apply_PostOp<FuncSumPostDiv<T>, /*EltPerPack=*/1> {
 template<typename Fn, int BytePerPack>
 struct Apply_LoadMultimem {
   __device__ static BytePack<BytePerPack> load(Fn fn, uintptr_t addr) {
-    __trap();
+    //__trap();
     return {};
   }
 };

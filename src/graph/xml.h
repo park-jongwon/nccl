@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2019-2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -11,6 +12,7 @@
 #include "debug.h"
 #include "checks.h"
 #include <stdlib.h>
+#include "archinfo.h"
 
 // A few constraints to make the implementation easy
 #define MAX_STR_LEN 255
@@ -42,7 +44,7 @@ struct ncclXml {
 };
 
 /* File functions */
-#define NCCL_TOPO_XML_VERSION 1
+#define NCCL_TOPO_XML_VERSION 2
 ncclResult_t ncclTopoGetXmlFromFile(const char* xmlTopoFile, struct ncclXml* xml, int warn);
 ncclResult_t ncclTopoDumpXmlToFile(const char* xmlTopoFile, struct ncclXml* xml);
 #define NCCL_GRAPH_XML_VERSION 1
@@ -54,6 +56,8 @@ ncclResult_t ncclTopoFillNet(struct ncclXml* xml, const char* pciPath, const cha
 
 /* Remove unneeded parts */
 ncclResult_t ncclTopoTrimXml(struct ncclXml* xml);
+
+ncclResult_t ncclTopoGetStrFromSys(const char* path, const char* fileName, char* strValue);
 
 /**************/
 /* XML Struct */
@@ -295,4 +299,10 @@ static ncclResult_t kvConvertToStr(int value, const char** str, struct kvDict* d
   return ncclInternalError;
 }
 
+typedef union {
+  hipDeviceArch_t arch;
+  int value;
+  static_assert(sizeof(hipDeviceArch_t) == sizeof(int),
+      "value must be the same size of hipDeviceArch_t.");
+} rcclHipDeviceArch_t;
 #endif

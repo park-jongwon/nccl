@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2015-2021, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2021 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -36,7 +37,7 @@ static __inline__ int ncclTypeSize(ncclDataType_t type) {
     case ncclUint8:
       return 1;
     case ncclFloat16:
-#if defined(__CUDA_BF16_TYPES_EXIST__)
+#if defined(RCCL_BFLOAT16)
     case ncclBfloat16:
 #endif
       return 2;
@@ -55,10 +56,10 @@ static __inline__ int ncclTypeSize(ncclDataType_t type) {
 
 #include "debug.h"
 #include "checks.h"
-#include "cudawrap.h"
+#include "rocmwrap.h"
 #include "alloc.h"
 #include "utils.h"
 #include "param.h"
-#include "nvtx.h"
+#include "nvtx_stub.h"
 
 #endif // end include guard

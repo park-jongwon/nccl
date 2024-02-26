@@ -1,5 +1,6 @@
 /*************************************************************************
  * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -11,7 +12,11 @@
 
 namespace {
   template<typename T, typename RedOp>
-  __device__ __forceinline__ void oneRankReduce() {
+#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx940__) && !defined(__gfx941__) && !defined(__gfx942__)
+  __device__ void oneRankReduce() {
+#else
+  __device__ __attribute__((noinline)) void oneRankReduce() {
+#endif
     ncclWork *w = &ncclShmem.work;
     int tid = threadIdx.x;
     int tn = blockDim.x;
@@ -43,10 +48,17 @@ namespace {
   }
 }
 
+#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx940__) && !defined(__gfx941__) && !defined(__gfx942__)
 #define INSTANTIATE(devredop, type) \
   __device__ void NCCL_ONERANK_REDUCE_NAME(devredop, type)() { \
     oneRankReduce<type, Func##devredop<type>>(); \
   }
+#else
+#define INSTANTIATE(devredop, type) \
+  __device__ __attribute__((noinline)) void NCCL_ONERANK_REDUCE_NAME(devredop, type)() { \
+    oneRankReduce<type, Func##devredop<type>>(); \
+  }
+#endif
 
 INSTANTIATE(PreMulSum, int8_t)
 INSTANTIATE(PreMulSum, uint8_t)
@@ -55,8 +67,8 @@ INSTANTIATE(PreMulSum, uint32_t)
 INSTANTIATE(PreMulSum, int64_t)
 INSTANTIATE(PreMulSum, uint64_t)
 INSTANTIATE(PreMulSum, half)
-#if defined(__CUDA_BF16_TYPES_EXIST__)
-INSTANTIATE(PreMulSum, __nv_bfloat16)
+#if defined(RCCL_BFLOAT16)
+INSTANTIATE(PreMulSum, rccl_bfloat16)
 #endif
 INSTANTIATE(PreMulSum, float)
 INSTANTIATE(PreMulSum, double)
